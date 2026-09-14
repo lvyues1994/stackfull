@@ -38,6 +38,10 @@ struct SchedulerOptions {
     // Borrowed event source (the IO layer's Poller). nullptr: idle workers
     // sleep on futex/condvar only; timers still work.
     Driver *driver = nullptr;
+    // false: makeScheduler() starts every worker thread at once.
+    // true:  one worker is reserved for the thread that calls run(); the
+    //        others start immediately.
+    bool callerIsWorker = false;
 #if STACKFULL_HAS_EXCEPTIONS
     // Borrowed; nullptr selects the aborting default.
     ExceptionSink *exceptionSink = nullptr;

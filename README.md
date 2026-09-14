@@ -6,10 +6,13 @@
 
 ```
 ┌───────────────────────────────────────────────────────────┐
+│ runtime         defaultScheduler · go · async · blockOn       │  ✔
+├───────────────────────────────────────────────────────────┤
 │ L4b io          Poller(Driver) epoll/poll · 定时器 · fd 包装   │  ✔
 ├───────────────────────────────────────────────────────────┤
 │ L4a sync        Semaphore · Mutex · CondVar · WaitGroup ·     │  ✔
 │                 Channel<T>（任务与普通线程都能用）              │
+│                 回调桥接：Completion · Stream · Mailbox · select│
 ├───────────────────────────────────────────────────────────┤
 │ L3  sched       M:N 调度器：BWoS 本地队列 · BBQ 注入队列 ·     │  ✔
 │                 直接交接 · park/wake · pin · JoinHandle       │
@@ -23,7 +26,7 @@
 └───────────────────────────────────────────────────────────┘
 ```
 
-每层一个 CMake target：`stackfull::fcontext`、`stackfull::stack`、`stackfull::coro`、`stackfull::queue`（无锁队列，header-only）、`stackfull::sched`、`stackfull::sync`、`stackfull::io`；`stackfull::stackfull` 是聚合目标。
+每层一个 CMake target：`stackfull::fcontext`、`stackfull::stack`、`stackfull::coro`、`stackfull::queue`（无锁队列，header-only）、`stackfull::sched`、`stackfull::sync`、`stackfull::io`、`stackfull::runtime`；`stackfull::stackfull` 是聚合目标。
 
 ## 使用
 
@@ -59,8 +62,7 @@ assert(c.isDone());
 #include <stackfull/sched/ThisTask.h>
 using namespace stackfull::sched;
 
-auto scheduler = makeScheduler();          // workers = hardware_concurrency
-scheduler->start();                        // 或 run()：调用线程自己当 worker
+auto scheduler = makeScheduler();          // workers = hardware_concurrency，返回即已在跑
 
 scheduler->spawn([] {                      // detached
     this_task::yield();                    // 让其他任务先跑
@@ -74,6 +76,21 @@ job.handle.join();                         // 任务内调用则 park，线程�
 
 scheduler->stop();                         // 非阻塞：拒绝新 spawn，唤醒所有 parked 任务一次，
                                            // 仍 parked 的任务被 ForcedUnwind；析构函数 join 线程
+```
+
+想让调用线程自己当 worker：`SchedulerOptions::callerIsWorker = true`，其余 worker 立即启动，保留的那个由 `run()` 提供（直到 `stop()`）。应用层不必自己建调度器：
+
+```cpp
+#include <stackfull/runtime/Runtime.h>
+using namespace stackfull;
+
+int main() {
+    return blockOn([] {                    // 在进程级默认调度器上跑，阻塞 main 线程直到返回
+        go([] { backgroundWork(); });      // fire-and-forget
+        auto answer = async([] { return compute(); });   // Completion<int>
+        return answer.get().value;
+    });
+}
 ```
 
 设计要点：
@@ -119,6 +136,50 @@ done.wait();                                    // 主线程：阻塞在线程 P
 - 构造 `Waiter` 时绑定当前上下文：任务用 `WakeToken` park/wake，普通线程用线程本地 `Parker` 阻塞。`Mutex`、`Channel`、`WaitGroup` 因此在主线程和任务之间通用。
 - `Semaphore` 是核心（快路径允许插队，多余许可按 FIFO 移交等待者），`Mutex` 是二元信号量。`Channel<T>` 有界 MPMC，`close()` 唤醒所有阻塞方。
 - 语义与 std 一致：`ConditionVariable::wait` 可能虚假返回，按谓词循环；`Mutex` 非递归。
+
+## 回调式 SDK 桥接
+
+SDK 从自己的线程回调，任务在这里等：三种形状，三个类型。
+
+```cpp
+#include <stackfull/sync/Completion.h>
+#include <stackfull/sync/Stream.h>
+#include <stackfull/sync/Mailbox.h>
+#include <stackfull/sync/Select.h>
+
+// 1. 一次性结果：Completion 既是回调也是等待句柄，T 用 completionFor<签名>() 推导
+auto read = completionFor<Sdk::OnRead>();       // OnRead = std::function<void(int, std::error_code)>
+sdk.readAsync(handle, read);                    // 把它当回调传进去
+auto outcome = read.getFor(std::chrono::seconds{2});   // 任务 park；超时 error == timed_out
+if (outcome) use(std::get<0>(outcome.value));
+
+// C 风格 (fn, void *user)：toRaw()/fromRaw() 在蹦床里穿越 void*
+Completion<std::string> done;
+c_read(fd, [](void *user, int rc, char const *data, size_t n) {
+    Completion<std::string>::fromRaw(user).set(std::string(data, n));
+}, done.toRaw());
+
+// 2. 流式：Stream<T> 有界、生产者永不阻塞，满了默认丢最旧；Latest<T> 只留最新一帧
+Latest<Frame> frames;                           // 30 ms 一帧的相机
+sdk.onFrame([&](Frame f) { frames.push(std::move(f)); });
+Frame frame;
+while (frames.nextFor(std::chrono::milliseconds{200}, frame)) process(frame);
+
+// 3. 监听器接口（虚函数在 SDK 线程被调）：每个虚函数往 Mailbox 投一个闭包，任务按序执行
+struct Bridge : CameraListener {
+    Mailbox inbox;
+    void onFrame(Frame const &f) override { inbox.post([this, f] { handle(f); }); }
+    void onStopped() override { inbox.post([this] { inbox.close(); }); }
+};
+bridge.inbox.run();                             // 闭包在任务上下文运行：可以 park、拿 Mutex、做 IO
+
+// 多源：select 返回先就绪的下标，随后用对应源的 tryNext()/get()
+switch (select(control, frames)) { case 0: ...; case 1: ...; }
+```
+
+- 三种类型都是"回调一侧持有、任务一侧等待"：状态里按值记录等待者的 `WakeToken`/`Parker`，从不指向任务栈。任务被 `stop()` 展开甚至（无异常构建）直接释放后回调迟到，只是往无人读的状态里写一次；`select` 让同一等待者挂在多个源上也因此无需额外协议。
+- `Completion` 可拷贝、`set()`/`fail()` 首次生效、`get()` 单消费者移出结果；`Completion<void>` 接受并忽略任何回调参数。`Stream` 单消费者，`close()` 后 `next()` 排空再返回 false；`Mailbox` 无界（丢控制事件比增长更糟）。
+- 任务里等回调不占 worker：`get()`/`next()` park 后 worker 去跑别的任务，回调线程只做一次 `wake()`。
 
 ## 定时器与 IO
 
@@ -216,7 +277,8 @@ gcc 13 -O3；Android 列为小米 25091RP04C（arm64，Android 16）上 NDK r28 
 - 无抢占。CPU 密集循环必须周期性 `this_task::yield()` 并检查 `stopRequested()`；只有 parked 的任务能被 `stop()` 从外部结束，一个永不 park 的任务会让 `stop()` 等不到 `liveTasks == 0`。
 - 任务内阻塞系统调用会卡住整个 worker；先用 `pinToCurrentWorker()` 把线程亲和性相关代码钉住，IO 集成留给 L4。
 - `WakeToken::wake()` 可从任意线程调用；`park()` 允许虚假返回，按条件循环。
-- `Scheduler` 析构前不要求所有任务已结束，但要求 `run()` 已返回或 `start()` 过的 worker 可被 join。
+- `Scheduler` 析构前不要求所有任务已结束，但要求 `run()` 已返回；析构函数 join 所有 worker 线程。
+- 调度器要活得比可能到达的回调久：`WakeToken` 只对已死任务安全，对已析构的调度器不安全（默认调度器不析构）。
 
 同步原语：
 

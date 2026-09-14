@@ -18,7 +18,11 @@ namespace sched {
 namespace {
 
 struct SchedulerImpl final : Scheduler {
-    explicit SchedulerImpl(SchedulerOptions const &options) : core_(options) {}
+    explicit SchedulerImpl(SchedulerOptions const &options) : core_(options) {
+        // Running from the start. Worker 0 stays reserved when the caller
+        // wants to be a worker; run() supplies it.
+        launchFrom(options.callerIsWorker ? 1 : 0);
+    }
 
     // Over-aligned members (queues) need more than C++14 `new` guarantees.
     // The virtual destructor makes `delete` on the base pointer find these.
@@ -36,25 +40,14 @@ struct SchedulerImpl final : Scheduler {
         joinThreads();
     }
 
-    void start() override {
-        std::lock_guard<std::mutex> const lock(lifecycle);
-        STACKFULL_CHECK(not started, "stackfull: Scheduler started twice");
-        started = true;
-        for (auto const &worker : core_.workers) {
-            detail::Worker *const raw = worker.get();
-            threads.emplace_back([raw] { raw->run(); });
-        }
-    }
+    void start() override { launchFrom(0); }
 
     void run() override {
         {
             std::lock_guard<std::mutex> const lock(lifecycle);
-            STACKFULL_CHECK(not started, "stackfull: Scheduler started twice");
-            started = true;
-            for (std::size_t i = 1; i < core_.workers.size(); ++i) {
-                detail::Worker *const worker = core_.workers[i].get();
-                threads.emplace_back([worker] { worker->run(); });
-            }
+            STACKFULL_CHECK(core_.options.callerIsWorker, "stackfull: run() requires SchedulerOptions::callerIsWorker");
+            STACKFULL_CHECK(not worker0Taken, "stackfull: run() called twice");
+            worker0Taken = true;
         }
         core_.workers[0]->run();
         joinThreads();
@@ -77,6 +70,25 @@ protected:
     detail::SchedulerCore &core() noexcept override { return core_; }
 
 private:
+    // Starts background threads for workers [first, N) not yet launched.
+    void launchFrom(std::size_t const first) {
+        std::lock_guard<std::mutex> const lock(lifecycle);
+        for (std::size_t i = first; i < core_.workers.size(); ++i) {
+            if (launched[i]) {
+                continue;
+            }
+            if (i == 0) {
+                if (worker0Taken) {
+                    continue;
+                }
+                worker0Taken = true;
+            }
+            launched[i] = true;
+            detail::Worker *const worker = core_.workers[i].get();
+            threads.emplace_back([worker] { worker->run(); });
+        }
+    }
+
     void joinThreads() {
         std::vector<std::thread> mine;
         {
@@ -92,7 +104,8 @@ private:
 
     detail::SchedulerCore core_;
     std::mutex lifecycle;
-    bool started = false;
+    bool worker0Taken = false;
+    std::vector<bool> launched = std::vector<bool>(detail::kMaxWorkers, false);
     std::vector<std::thread> threads;
 };
 

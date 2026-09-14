@@ -2,8 +2,11 @@
 
 #include <stackfull/sched/Parker.h>
 #include <stackfull/sched/ThisTask.h>
+#include <stackfull/sched/detail/Runtime.h>
+#include <stackfull/sched/detail/TimerQueue.h>
 
 #include <atomic>
+#include <chrono>
 #include <memory>
 #include <thread>
 
@@ -42,6 +45,38 @@ void Waiter::wait() {
     while (not satisfied.load(std::memory_order_acquire)) {
         sched::this_task::park();
     }
+}
+
+void Waiter::block() {
+    if (parker != nullptr) {
+        parker->park();
+    } else {
+        sched::this_task::park();
+    }
+}
+
+bool Waiter::blockUntil(std::chrono::steady_clock::time_point const deadline) {
+    if (parker != nullptr) {
+        auto const now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            return false;
+        }
+        return parker->parkFor(std::chrono::duration_cast<std::chrono::nanoseconds>(deadline - now));
+    }
+
+    sched::detail::CurrentTask const current = sched::detail::currentTask();
+    sched::detail::TimerEntry timer;
+    timer.deadline = deadline;
+    timer.token = token;
+    sched::detail::TimerQueue &queue = current.worker.core.timers;
+    current.worker.core.addTimer(timer);
+    struct CancelTimer {
+        sched::detail::TimerQueue &queue;
+        sched::detail::TimerEntry &timer;
+        ~CancelTimer() { queue.cancel(timer); }
+    } cancelTimer{queue, timer};
+    sched::this_task::park();
+    return not timer.fired.load(std::memory_order_acquire);
 }
 
 void Waiter::awaitNotifier() noexcept {

@@ -53,6 +53,7 @@ add_subdirectory(coro)       # L2: Context / Coroutine
 add_subdirectory(sched)      # L3: M:N scheduler
 add_subdirectory(sync)       # L4a: task-aware synchronization primitives
 add_subdirectory(io)         # L4b: poller-driven asynchronous IO
+add_subdirectory(runtime)    # defaultScheduler / go / async / blockOn
 
 if(STACKFULL_BUILD_TESTS)
     enable_testing()

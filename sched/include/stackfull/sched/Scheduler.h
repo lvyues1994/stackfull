@@ -24,9 +24,14 @@ struct JoinableSpawnResult {
 // M:N scheduler: N worker threads run M tasks, each a stackful coroutine
 // that may suspend on any worker and continue on another.
 //
-//   start()  launches all workers in the background.
-//   run()    launches all but one worker and runs the last on the calling
-//            thread until the scheduler has stopped.
+// makeScheduler() returns a *running* scheduler: spawn() right away. With
+// SchedulerOptions::callerIsWorker one worker is held back for the thread
+// that calls run().
+//
+//   run()    (callerIsWorker only) turns the calling thread into the
+//            reserved worker until the scheduler has stopped.
+//   start()  starts any worker not yet running; a no-op in the default
+//            configuration, kept so code written for explicit start works.
 //   stop()   requests shutdown from any thread and returns at once: spawn()
 //            begins to fail, every parked task is woken once so cooperative
 //            code sees this_task::stopRequested(), and tasks still parked

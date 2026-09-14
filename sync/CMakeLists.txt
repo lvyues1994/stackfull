@@ -7,6 +7,10 @@ add_library(stackfull_sync STATIC
     include/stackfull/sync/ConditionVariable.h
     include/stackfull/sync/WaitGroup.h
     include/stackfull/sync/Channel.h
+    include/stackfull/sync/Completion.h
+    include/stackfull/sync/Stream.h
+    include/stackfull/sync/Mailbox.h
+    include/stackfull/sync/Select.h
     include/stackfull/sync/detail/Waiter.h
     src/Waiter.cpp
     src/Semaphore.cpp

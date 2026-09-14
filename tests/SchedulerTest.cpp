@@ -27,6 +27,15 @@ SchedulerOptions withWorkers(std::size_t const workers) {
     return options;
 }
 
+// A scheduler whose single worker does not run until start()/run(): lets a
+// test set up several tasks before any of them moves.
+SchedulerOptions deferredSingleWorker() {
+    SchedulerOptions options;
+    options.workers = 1;
+    options.callerIsWorker = true;
+    return options;
+}
+
 // Poll until no task is alive (or fail after `timeout`).
 bool waitIdle(Scheduler &scheduler, std::chrono::milliseconds const timeout = std::chrono::seconds{10}) {
     auto const deadline = std::chrono::steady_clock::now() + timeout;
@@ -69,8 +78,16 @@ TEST(Scheduler, RunsSpawnedTasksToCompletion) {
     scheduler->stop();
 }
 
-TEST(Scheduler, SpawnBeforeStartRunsAfterStart) {
+TEST(Scheduler, MakeSchedulerIsAlreadyRunning) {
     auto scheduler = makeScheduler(withWorkers(2));
+    std::atomic<int> counter{0};
+    ASSERT_TRUE(scheduler->spawn([&] { counter.fetch_add(1); }));
+    ASSERT_TRUE(waitIdle(*scheduler)); // no start() needed
+    EXPECT_EQ(counter.load(), 1);
+}
+
+TEST(Scheduler, ReservedWorkerRunsNothingUntilStarted) {
+    auto scheduler = makeScheduler(deferredSingleWorker());
     std::atomic<int> counter{0};
     for (int i = 0; i < 10; ++i) {
         ASSERT_TRUE(scheduler->spawn([&] { counter.fetch_add(1); }));
@@ -84,7 +101,7 @@ TEST(Scheduler, SpawnBeforeStartRunsAfterStart) {
 TEST(Scheduler, DestructorWithoutStartReleasesUnstartedTasks) {
     std::atomic<int> destroyed{0};
     {
-        auto scheduler = makeScheduler(withWorkers(1));
+        auto scheduler = makeScheduler(deferredSingleWorker());
         auto tracer = std::make_shared<Tracer>(destroyed);
         ASSERT_TRUE(scheduler->spawn([tracer] {}));
         tracer.reset();
@@ -94,7 +111,7 @@ TEST(Scheduler, DestructorWithoutStartReleasesUnstartedTasks) {
 }
 
 TEST(Scheduler, YieldInterleavesTasksOnOneWorker) {
-    auto scheduler = makeScheduler(withWorkers(1));
+    auto scheduler = makeScheduler(deferredSingleWorker());
     std::vector<std::string> log;
     auto body = [&](std::string const name) {
         return [&log, name] {
@@ -340,7 +357,7 @@ TEST(Scheduler, DroppingAJoinHandleDetaches) {
 // ---------------------------------------------------------------------------
 
 TEST(Scheduler, SpawnFailsBeyondMaxTasks) {
-    SchedulerOptions options = withWorkers(1);
+    SchedulerOptions options = deferredSingleWorker(); // tasks stay alive until start()
     options.maxTasks = 4;
     auto scheduler = makeScheduler(options);
     for (int i = 0; i < 4; ++i) {
@@ -393,7 +410,9 @@ TEST(Scheduler, StopWakesParkedTasksOnce) {
 }
 
 TEST(Scheduler, RunOnCallingThreadReturnsAfterStop) {
-    auto scheduler = makeScheduler(withWorkers(2));
+    SchedulerOptions options = withWorkers(2);
+    options.callerIsWorker = true;
+    auto scheduler = makeScheduler(options);
     std::atomic<bool> ran{false};
     ASSERT_TRUE(scheduler->spawn([&] {
         ran.store(true);

@@ -5,10 +5,42 @@
 #include <stackfull/sync/SpinLock.h>
 
 #include <atomic>
+#include <chrono>
 
 namespace stackfull {
 namespace sync {
 namespace detail {
+
+// Value handle for waking a blocked party: a task's WakeToken, or a plain
+// thread's Parker. Safe to keep after the party moved on — waking a task
+// that no longer waits (or no longer exists) is a no-op or a spurious wake,
+// which every wait loop tolerates. Event sources that outlive their
+// awaiters (Completion, Stream, Mailbox) store this instead of a pointer to
+// a stack-resident Waiter, so even a task released without unwinding
+// (no-exceptions builds) leaves nothing dangling behind. The one thing a
+// stale token still needs is the Scheduler it belongs to: keep schedulers
+// alive for as long as callbacks may arrive (the default one is immortal).
+struct Waker {
+    sched::WakeToken token{};
+    sched::Parker *parker = nullptr;
+
+    void wake() const noexcept {
+        if (parker != nullptr) {
+            parker->unpark();
+        } else if (token) {
+            token.wake();
+        }
+    }
+    bool isEmpty() const noexcept { return parker == nullptr and not token; }
+    void clear() noexcept {
+        parker = nullptr;
+        token = sched::WakeToken{};
+    }
+    friend bool operator==(Waker const &a, Waker const &b) noexcept {
+        return a.parker == b.parker and a.token.core == b.token.core and a.token.slot == b.token.slot and
+               a.token.generation == b.token.generation;
+    }
+};
 
 // One blocked party, living on the waiter's own stack (coroutine or OS
 // thread) for as long as it is linked into a primitive's WaitList. Works for
@@ -39,6 +71,15 @@ struct Waiter {
     // Blocks the current task or thread until notify(). Not noexcept: a
     // forced unwind is thrown at the park inside.
     void wait();
+
+    // Condition-less variants for sources that keep their own readiness
+    // state and store a Waker by value: block once (spurious returns
+    // allowed), or block until `deadline` (false on timeout). A task uses
+    // the scheduler's timer queue, a thread its Parker's timed park.
+    void block();
+    bool blockUntil(std::chrono::steady_clock::time_point deadline);
+
+    Waker waker() const noexcept { return Waker{token, parker}; }
 
     // Called by the notifier after unlinking the waiter.
     void notify() noexcept {

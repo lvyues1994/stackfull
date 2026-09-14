@@ -37,3 +37,4 @@ stackfull_add_test(stackfull_sched_test    LABEL sched LIBS stackfull::sched SOU
 stackfull_add_test(stackfull_sync_test     LABEL sync LIBS stackfull::sync SOURCES SyncTest.cpp)
 stackfull_add_test(stackfull_timer_test    LABEL sched LIBS stackfull::sync SOURCES TimerTest.cpp)
 stackfull_add_test(stackfull_io_test       LABEL io LIBS stackfull::io stackfull::sync SOURCES IoTest.cpp)
+stackfull_add_test(stackfull_bridge_test   LABEL sync LIBS stackfull::runtime SOURCES BridgeTest.cpp)
