@@ -8,7 +8,8 @@
 ┌───────────────────────────────────────────────────────────┐
 │ L4  sync / io   Mutex · CondVar · Channel<T> · Poller        │  规划中
 ├───────────────────────────────────────────────────────────┤
-│ L3  sched       调度器（M:N，可迁移）                          │  规划中
+│ L3  sched       M:N 调度器：BWoS 本地队列 · BBQ 注入队列 ·     │  ✔
+│                 直接交接 · park/wake · pin · JoinHandle       │
 ├───────────────────────────────────────────────────────────┤
 │ L2  coro        Coroutine（resume/yield）· 栈顶控制块 ·        │  ✔
 │                 异常搬运 · ForcedUnwind · eh_globals 交换      │
@@ -19,7 +20,7 @@
 └───────────────────────────────────────────────────────────┘
 ```
 
-每层一个 CMake target：`stackfull::fcontext`、`stackfull::stack`、`stackfull::coro`；`stackfull::stackfull` 是聚合目标。
+每层一个 CMake target：`stackfull::fcontext`、`stackfull::stack`、`stackfull::coro`、`stackfull::queue`（无锁队列，header-only）、`stackfull::sched`；`stackfull::stackfull` 是聚合目标。
 
 ## 使用
 
@@ -48,6 +49,38 @@ assert(c.isDone());
 
 `CoroutineOptions` 可指定 `stackSize`（默认 128 KiB）和 `StackAllocator*`（默认是 mmap + guard page 之上的线程本地池）。
 
+## 调度器
+
+```cpp
+#include <stackfull/sched/Scheduler.h>
+#include <stackfull/sched/ThisTask.h>
+using namespace stackfull::sched;
+
+auto scheduler = makeScheduler();          // workers = hardware_concurrency
+scheduler->start();                        // 或 run()：调用线程自己当 worker
+
+scheduler->spawn([] {                      // detached
+    this_task::yield();                    // 让其他任务先跑
+    WakeToken const me = this_task::token();
+    handOffToSomewhere(me);                // 任意线程稍后 me.wake()
+    this_task::park();                     // 可能被虚假唤醒，按条件循环
+});
+
+auto job = scheduler->spawnJoinable([] { /* ... */ });
+job.handle.join();                         // 任务内调用则 park，线程调用则阻塞；重抛任务异常
+
+scheduler->stop();                         // 非阻塞：拒绝新 spawn，唤醒所有 parked 任务一次，
+                                           // 仍 parked 的任务被 ForcedUnwind；析构函数 join 线程
+```
+
+设计要点：
+
+- **本地队列 BWoS**（OSDI'23，自 Tokio 参考实现移植，`queue/PROVENANCE.md`）：owner 快路径块内 relaxed 原子、零屏障；窃取按块。全局注入队列 **BBQ**（ATC'22）无锁 MPMC，容量绑定 `maxTasks` 故永不满；slab 空闲索引同样用 BBQ。`-DSTACKFULL_SCHED_QUEUE=RING` 切换到 Go 风格环形队列做对照。
+- **直接交接**：`yield/park/结束` 在任务栈上取下一个本地任务并一次切换过去；`PostSwitchHook` 在到达方执行重入队 / park 状态迁移 / 释放栈，保证任务寄存器保存完毕后才可能被别的线程恢复。
+- **park/wake 协议**：`Running → Parked → Notified → Running` 两侧各一次原子操作，无锁无自旋；wake 令牌粘滞，早到的 wake 让下一次 park 立即返回。`WakeToken` 是 `(slot, generation)`，释放时等待 pin 计数归零，过期令牌安全。
+- **放置策略**：pinned → 所属 worker 收件箱；有空闲 worker → 注入队列 + unpark 一个（BWoS 偷不到短队列，空闲者要喂而不是让它偷）；全忙 → 本地 LIFO 槽（连续 3 次后让队列）；外部线程 → 注入队列。空闲 worker 先自旋搜索再睡，生产者看到有搜索者就不发 futex。
+- **栈池共享层**：任务栈通常由 spawn 方线程分配、由运行它的 worker 释放，纯线程本地池会退化成每任务一次 mmap；池化分配器增加了一层无锁共享池（BBQ）。
+
 ## 构建
 
 ```sh
@@ -60,24 +93,45 @@ cmake --preset release && cmake --build --preset release && ctest --preset relea
 | `clang-release` | Linux x86_64，clang |
 | `asan` | AddressSanitizer，切换路径带 fiber 注解 |
 | `noexc` | `-fno-exceptions` 全量编译与测试 |
+| `tsan` | ThreadSanitizer，仅队列层（协程切换尚无 TSan fiber 注解） |
 | `pthread-tls` | 强制 `pthread_key` TLS 后端 |
 | `android-arm64` / `android-arm64-api24` / `android-armv7` | 需要 `ANDROID_NDK_HOME` |
 | `qnx-aarch64le` / `qnx-x86_64` | 需要先 `source qnxsdp-env.sh` |
 
-CMake 选项：`STACKFULL_EXCEPTIONS`、`STACKFULL_SWAP_EH_GLOBALS`、`STACKFULL_TLS_BACKEND`（AUTO / THREAD_LOCAL / PTHREAD_KEY，AUTO 在 Android API < 29 选 pthread_key 以避开 emutls）、`STACKFULL_SANITIZE`。
+CMake 选项：`STACKFULL_EXCEPTIONS`、`STACKFULL_SWAP_EH_GLOBALS`、`STACKFULL_TLS_BACKEND`（AUTO / THREAD_LOCAL / PTHREAD_KEY，AUTO 在 Android API < 29 选 pthread_key 以避开 emutls）、`STACKFULL_SCHED_QUEUE`（BWOS / RING）、`STACKFULL_SANITIZE`。
 
-## 性能（Linux x86_64，gcc 13 -O3，`bench/stackfull_switch_bench`）
+Android 设备上跑测试：`cmake --preset android-arm64 -DSTACKFULL_BUILD_TESTS=ON && cmake --build --preset android-arm64`，把 `build/android-arm64/tests/*_test` `adb push` 到 `/data/local/tmp` 直接运行（`c++_static`，无额外依赖）。
 
-| 操作 | 耗时 |
-|---|---|
-| 裸 fcontext jump | 2.8 ns / 次切换 |
-| `resume()` + `yield()` | 4.8 ns / 次切换 |
-| 创建 + 运行 + 销毁（池化栈） | 27 ns |
-| 创建 + 运行 + 销毁（裸 mmap） | 2.4 µs |
+## 性能
 
-`resume()`/`yield()` 故意内联在头文件里：栈切换后返回地址预测器失效，每多一层 `ret` 就多一次约 5 ns 的错误预测。
+gcc 13 -O3；Android 列为小米 25091RP04C（arm64，Android 16）上 NDK r28 构建的实测。
+
+| 操作 | x86_64 | Android arm64 |
+|---|---|---|
+| 裸 fcontext jump（每次切换） | 2.8 ns | 12 ns |
+| `Coroutine::resume()` + `yield()`（每次切换） | 4.8 ns | 24 ns |
+| 协程创建 + 运行 + 销毁（池化栈） | 26 ns | 84 ns |
+| BWoS owner push+pop，无 thief | 2.6 ns | 9 ns |
+| BWoS owner push+pop，3 个 thief 持续窃取 | 5.5 ns | 74 ns |
+| Ring（Go 风格）owner push+pop，3 个 thief | 165 ns | 244 ns |
+| 调度器 `yield` 两任务直接交接（每次切换） | 15.8 ns | 42 ns |
+| 同 worker park/wake 交接 | 22.5 ns | 62 ns |
+| 跨 worker（pinned）park/wake 交接 | 60 ns | 99 ns |
+| spawn + 运行 + 释放，1 worker | 124 ns | 198 ns |
+| spawn + 运行 + 释放，4 workers（放置到空闲 worker） | 258 ns | 419 ns |
+
+切换路径上的所有函数（`resume/yield`、`switchTo/onArrival`、`this_task::yield/park`）强制内联：栈切换后返回地址预测器失效，每多一层 `ret` 就多一次约 5 ns 的错误预测；GCC 自己不会内联这些"太大"的函数，实测 34 → 15.8 ns。
 
 ## 使用约束
+
+调度器：
+
+- 无抢占。CPU 密集循环必须周期性 `this_task::yield()` 并检查 `stopRequested()`；只有 parked 的任务能被 `stop()` 从外部结束，一个永不 park 的任务会让 `stop()` 等不到 `liveTasks == 0`。
+- 任务内阻塞系统调用会卡住整个 worker；先用 `pinToCurrentWorker()` 把线程亲和性相关代码钉住，IO 集成留给 L4。
+- `WakeToken::wake()` 可从任意线程调用；`park()` 允许虚假返回，按条件循环。
+- `Scheduler` 析构前不要求所有任务已结束，但要求 `run()` 已返回或 `start()` 过的 worker 可被 join。
+
+协程层：
 
 - 协程可能在线程间迁移，**不要跨 `yield()` 持有 `thread_local` 变量地址、`errno`、`pthread_self()`/`std::this_thread::get_id()` 的结果**：glibc 把 `pthread_self` 和 `__errno_location` 标记为 `const`，优化器会把它们跨 yield 合并。
 - 协程内的 `catch (...)` 必须 `throw;` 重抛，否则会吞掉 `ForcedUnwind`。
@@ -91,4 +145,6 @@ CMake 选项：`STACKFULL_EXCEPTIONS`、`STACKFULL_SWAP_EH_GLOBALS`、`STACKFULL
 - Android NDK 的 libc++abi 不在 `<cxxabi.h>` 中声明 `__cxa_get_globals`，库内自行按 Itanium ABI 声明。
 - armv7（ARM EHABI）的 `__cxa_eh_globals` 多一个字段，`EhGlobals` 已按 `__ARM_DWARF_EH__` 区分。
 - QNX 仅有交叉编译配置，`MAP_STACK` / `MAP_LAZY` 语义待真机验证。
+- armv7 仅交叉编译验证（手头设备为 64 位 only）：Thumb 互操作与 EHABI 三字段 `__cxa_eh_globals` 尚未在真机上跑过。
+- 调度器用 `atomic_thread_fence(seq_cst)` 做 Dekker 配对（inject ↔ parkIdle），TSan 不建模 fence，所以 `tsan` preset 只跑队列层。
 - arm64 汇编尚无 BTI/PAC 落地指令；开启 `-mbranch-protection` 且 `-z force-bti` 时链接器会警告并对该目标关闭 BTI。

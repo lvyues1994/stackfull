@@ -10,6 +10,7 @@ if(NOT GTest_FOUND)
 endif()
 
 include(GoogleTest)
+find_package(Threads REQUIRED)
 
 # stackfull_add_test(<name> LABEL <label> LIBS <targets...> SOURCES <files...>)
 #
