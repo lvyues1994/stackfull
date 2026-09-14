@@ -2,6 +2,7 @@
 
 #include <stackfull/coro/Config.h>
 #include <stackfull/coro/Coroutine.h> // EntryImpl, StackReleaseGuard
+#include <stackfull/coro/detail/Sanitizer.h>
 #include <stackfull/coro/detail/StackLayout.h>
 #include <stackfull/fcontext/Fcontext.h>
 #include <stackfull/sched/SchedulerOptions.h>
@@ -109,6 +110,7 @@ TaskCreation createTask(SchedulerCore &core, F &&body, TaskOptions const &option
     task->asanBottom = allocation.stack.base;
     task->asanSize = allocation.stack.size;
 #endif
+    coro::detail::tsanCreateFiber(*task);
     task->fctx = fcontext::make(layout.stackTop, layout.usableSize, &taskEntry);
 
     core.slots[slot].task.store(task, std::memory_order_release);

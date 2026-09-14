@@ -175,8 +175,9 @@ Task *Worker::spinForWork() noexcept {
     }
     core.searching.fetch_sub(1, std::memory_order_seq_cst);
     // We may have been the searcher a producer relied on: re-check after
-    // stepping down (Dekker with the fence in SchedulerCore::inject).
-    std::atomic_thread_fence(std::memory_order_seq_cst);
+    // stepping down. A producer that saw us searching did its RMW on
+    // `searching` before ours, so our RMW reads-from it and its push is
+    // visible here (see SchedulerCore::notifyIdleWorker).
     if (task == nullptr) {
         task = takeLocal();
     }
@@ -186,9 +187,10 @@ Task *Worker::spinForWork() noexcept {
     return task;
 }
 
-// Publish idleness, then look once more: a producer that pushed before it
-// saw our idle bit is caught by this re-check (paired seq_cst fences with
-// SchedulerCore::inject / schedule). Returns work found on the re-check.
+// Publish idleness (an RMW on idleMask), then look once more: a producer
+// whose RMW on idleMask preceded ours did not see the bit, but ours then
+// reads-from its RMW and its task is visible on this re-check. Returns work
+// found before or instead of sleeping.
 Task *Worker::parkIdle() noexcept {
     if (not core.stopping.load(std::memory_order_acquire)) {
         if (Task *const found = spinForWork()) {
@@ -197,7 +199,6 @@ Task *Worker::parkIdle() noexcept {
     }
 
     core.markIdle(*this);
-    std::atomic_thread_fence(std::memory_order_seq_cst);
 
     Task *task = takeLocal();
     if (task == nullptr) {

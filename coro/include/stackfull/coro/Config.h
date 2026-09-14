@@ -39,6 +39,21 @@
 #endif
 #endif
 
+// --- ThreadSanitizer fiber annotations -------------------------------------
+#ifndef STACKFULL_HAS_TSAN
+#if defined(__SANITIZE_THREAD__)
+#define STACKFULL_HAS_TSAN 1
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define STACKFULL_HAS_TSAN 1
+#else
+#define STACKFULL_HAS_TSAN 0
+#endif
+#else
+#define STACKFULL_HAS_TSAN 0
+#endif
+#endif
+
 // --- TLS access model ------------------------------------------------------
 // Under -fPIC the default (global-dynamic) model routes every thread_local
 // access through __tls_get_addr. initial-exec is a single %fs-relative load

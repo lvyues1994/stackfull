@@ -4,6 +4,7 @@
 #include <stackfull/coro/Coroutine.h>
 #include <stackfull/coro/Fatal.h>
 #include <stackfull/coro/ForcedUnwind.h>
+#include <stackfull/coro/detail/Sanitizer.h>
 #include <stackfull/coro/detail/Switch.h>
 #include <stackfull/coro/detail/ThreadState.h>
 
@@ -69,6 +70,7 @@ void unwindSuspended(ContextBlock &block) {
 void releaseStack(ContextBlock &block) noexcept {
     stack::StackView const stack = block.stack;
     stack::StackAllocator *const allocator = block.allocator;
+    tsanDestroyFiber(block);
     block.~ContextBlock();
     allocator->deallocate(stack);
 }

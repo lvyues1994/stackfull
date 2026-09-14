@@ -4,6 +4,7 @@
 #include <stackfull/coro/CoroutineState.h>
 #include <stackfull/coro/Fatal.h>
 #include <stackfull/coro/detail/ContextBlock.h>
+#include <stackfull/coro/detail/Sanitizer.h>
 #include <stackfull/coro/detail/StackLayout.h>
 #include <stackfull/coro/detail/Switch.h>
 #include <stackfull/coro/detail/ThreadState.h>
@@ -200,6 +201,7 @@ CoroutineCreation makeCoroutine(F &&body, CoroutineOptions const &options) {
     block->asanBottom = allocation.stack.base;
     block->asanSize = allocation.stack.size;
 #endif
+    detail::tsanCreateFiber(*block);
     block->fctx = fcontext::make(layout.stackTop, layout.usableSize, &detail::contextEntry);
 
     guard.release();

@@ -66,6 +66,7 @@ STACKFULL_ALWAYS_INLINE void prepareDeparture(ContextBlock &from, ContextBlock &
 STACKFULL_ALWAYS_INLINE ThreadState &switchTo(ContextBlock &from, ContextBlock &to) {
     prepareDeparture(from, to, CoroutineState::Suspended);
     asanStartSwitch(from, to, /*fromWillResume=*/true);
+    tsanSwitchTo(to);
     fcontext::transfer_t const transfer = fcontext::jump(to.fctx, &from);
     return onArrival(from, transfer);
 }
@@ -76,6 +77,7 @@ STACKFULL_ALWAYS_INLINE ThreadState &switchTo(ContextBlock &from, ContextBlock &
 STACKFULL_ALWAYS_INLINE ThreadState &switchToOnTop(ContextBlock &from, ContextBlock &to, fcontext::ontop_fn const fn) {
     prepareDeparture(from, to, CoroutineState::Suspended);
     asanStartSwitch(from, to, /*fromWillResume=*/true);
+    tsanSwitchTo(to);
     fcontext::transfer_t const transfer = fcontext::ontop(to.fctx, &from, fn);
     return onArrival(from, transfer);
 }
@@ -84,6 +86,7 @@ STACKFULL_ALWAYS_INLINE ThreadState &switchToOnTop(ContextBlock &from, ContextBl
 [[noreturn]] inline void finishAndSwitchTo(ContextBlock &from, ContextBlock &to) {
     prepareDeparture(from, to, CoroutineState::Done);
     asanStartSwitch(from, to, /*fromWillResume=*/false);
+    tsanSwitchTo(to);
     fcontext::jump(to.fctx, &from);
     fatal("stackfull: a finished coroutine was resumed");
 }

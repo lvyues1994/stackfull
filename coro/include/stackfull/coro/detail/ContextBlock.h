@@ -75,6 +75,11 @@ struct alignas(16) ContextBlock {
     void const *asanBottom = nullptr;
     std::size_t asanSize = 0;
 #endif
+
+#if STACKFULL_HAS_TSAN
+    // TSan's notion of this context; the thread's own for a native context.
+    void *tsanFiber = nullptr;
+#endif
 };
 
 } // namespace detail

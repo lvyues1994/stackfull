@@ -16,7 +16,7 @@
 |---|---|
 | Paper | J. Wang et al., *BBQ: A Block-based Bounded Queue for Exchanging Data and Profiling*, ATC '22 |
 | Source followed | Fig. 3 / Fig. 4 of the paper, retry-new mode only (drop-old lines 27–28, 63, 71–72, 82–84 omitted) |
-| Memory orderings | Paper states 3 release + 3 acquire + 8 relaxed suffice after VSync optimisation but does not list them; this port uses acquire loads and release RMWs everywhere except the producer's `allocated` FAA and the MAX pre-reads. Conservative, not the paper's minimal set. |
+| Memory orderings | Paper states 3 release + 3 acquire + 8 relaxed suffice after VSync optimisation but does not list them; this port uses acquire loads and release RMWs throughout, plus acq_rel on the producer's `allocated` FAA: with a relaxed FAA a producer entering a block another producer just recycled does not synchronize with the recycler, and its slot write races with the previous round's read (found by ThreadSanitizer on a 2×2 configuration). Conservative, not the paper's minimal set. |
 | Atomic MAX | Emulated with a CAS loop (the paper's Armv8.1 LSE `MAX`); versions live in the high bits so integer comparison orders (version, offset). |
 
 ## RingQueue.h — reference ring

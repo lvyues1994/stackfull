@@ -44,7 +44,7 @@
     {
       "name": "tsan",
       "inherits": "release",
-      "displayName": "Linux x86_64 Release + ThreadSanitizer (queue tests only)",
+      "displayName": "Linux x86_64 Release + ThreadSanitizer (fiber annotations on the switch path)",
       "cacheVariables": {
         "STACKFULL_SANITIZE": "thread"
       }
@@ -209,11 +209,6 @@
       "configurePreset": "tsan",
       "output": {
         "outputOnFailure": true
-      },
-      "filter": {
-        "include": {
-          "label": "queue"
-        }
       }
     },
     {

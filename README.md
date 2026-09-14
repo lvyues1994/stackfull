@@ -93,7 +93,7 @@ cmake --preset release && cmake --build --preset release && ctest --preset relea
 | `clang-release` | Linux x86_64，clang |
 | `asan` | AddressSanitizer，切换路径带 fiber 注解 |
 | `noexc` | `-fno-exceptions` 全量编译与测试 |
-| `tsan` | ThreadSanitizer，仅队列层（协程切换尚无 TSan fiber 注解） |
+| `tsan` | ThreadSanitizer，全部测试（切换路径带 TSan fiber 注解） |
 | `pthread-tls` | 强制 `pthread_key` TLS 后端 |
 | `android-arm64` / `android-arm64-api24` / `android-armv7` | 需要 `ANDROID_NDK_HOME` |
 | `qnx-aarch64le` / `qnx-x86_64` | 需要先 `source qnxsdp-env.sh` |
@@ -146,5 +146,5 @@ gcc 13 -O3；Android 列为小米 25091RP04C（arm64，Android 16）上 NDK r28 
 - armv7（ARM EHABI）的 `__cxa_eh_globals` 多一个字段，`EhGlobals` 已按 `__ARM_DWARF_EH__` 区分。
 - QNX 仅有交叉编译配置，`MAP_STACK` / `MAP_LAZY` 语义待真机验证。
 - armv7 仅交叉编译验证（手头设备为 64 位 only）：Thumb 互操作与 EHABI 三字段 `__cxa_eh_globals` 尚未在真机上跑过。
-- 调度器用 `atomic_thread_fence(seq_cst)` 做 Dekker 配对（inject ↔ parkIdle），TSan 不建模 fence，所以 `tsan` preset 只跑队列层。
+- 调度器的 Dekker 配对（inject ↔ parkIdle、searching）用同一原子字上的 seq_cst RMW 而不是 fence：推导只依赖 modification order 与 reads-from，TSan 也能建模。
 - arm64 汇编尚无 BTI/PAC 落地指令；开启 `-mbranch-protection` 且 `-z force-bti` 时链接器会警告并对该目标关闭 BTI。

@@ -76,7 +76,11 @@ struct BbqQueue {
             // full block; the FAA result is still authoritative.
             Cursor const peek{block.allocated.load(std::memory_order_relaxed)};
             if (peek.index() < BlockSize) {
-                Cursor const slot{block.allocated.fetch_add(1, std::memory_order_relaxed)};
+                // acq_rel, not relaxed: a producer that lands in a block another
+                // producer has just recycled must synchronize with that reset
+                // (which itself acquired the previous round's `consumed`), or
+                // its write to the slot races with the previous round's read.
+                Cursor const slot{block.allocated.fetch_add(1, std::memory_order_acq_rel)};
                 if (slot.index() < BlockSize) {
                     block.entries[slot.index()] = value;
                     // Pairs with the acquire load of `committed` in pop().

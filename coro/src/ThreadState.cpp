@@ -1,6 +1,7 @@
 #include <stackfull/coro/detail/ThreadState.h>
 
 #include <stackfull/coro/Fatal.h>
+#include <stackfull/coro/detail/Sanitizer.h>
 
 #include <memory>
 
@@ -44,6 +45,7 @@ ThreadState *createThreadState() noexcept {
     auto state = std::make_unique<ThreadState>();
     state->mainBlock.thread = state.get();
     state->mainBlock.state = CoroutineState::Running;
+    tsanAdoptCurrentFiber(state->mainBlock);
     state->current = &state->mainBlock;
     if (stateKeyValid) {
         ::pthread_setspecific(stateKey, state.get());

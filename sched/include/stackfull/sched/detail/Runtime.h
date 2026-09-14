@@ -110,9 +110,6 @@ inline void SchedulerCore::inject(Task &task) noexcept {
             std::this_thread::yield(); // another thread is between allocate and commit
         }
     }
-    // Pairs with the fence in Worker::parkIdle(): either we see the idle bit
-    // or the idling worker sees our task on its re-check.
-    std::atomic_thread_fence(std::memory_order_seq_cst);
     notifyIdleWorker();
 }
 
@@ -125,8 +122,7 @@ inline void SchedulerCore::schedule(Task &task) noexcept {
     if (task.pinnedTo != nullptr) {
         Worker &target = *task.pinnedTo;
         target.pinnedInbox.push(task);
-        std::atomic_thread_fence(std::memory_order_seq_cst);
-        notifyWorker(target);
+        notifyWorker(target); // RMW on idleMask: orders the push against the worker's idle re-check
         return;
     }
     Worker *const me = currentWorker();

@@ -3,6 +3,7 @@
 #include "Unwind.h"
 
 #include <stackfull/coro/Fatal.h>
+#include <stackfull/coro/detail/Sanitizer.h>
 #include <stackfull/sched/detail/JoinState.h>
 #include <stackfull/sched/detail/Runtime.h>
 #include <stackfull/sched/detail/TaskFactory.h>
@@ -90,11 +91,17 @@ SchedulerCore::~SchedulerCore() {
     }
 }
 
+// Producer side of two Dekker pairs, done with RMWs on the very words the
+// workers RMW (not fences): in the modification order of `searching` /
+// `idleMask` our RMW is either after the worker's — then we observe it — or
+// before it, and the worker's RMW then reads-from ours and inherits the
+// happens-before with the task we just published. ThreadSanitizer models
+// this; it does not model fences.
 void SchedulerCore::notifyIdleWorker() noexcept {
-    if (searching.load(std::memory_order_acquire) > 0) {
+    if (searching.fetch_add(0, std::memory_order_seq_cst) > 0) {
         return; // a searching worker will find the work without a futex
     }
-    std::uint64_t mask = idleMask.load(std::memory_order_seq_cst);
+    std::uint64_t mask = idleMask.fetch_or(0, std::memory_order_seq_cst);
     while (mask != 0) {
         auto const index = static_cast<std::size_t>(__builtin_ctzll(mask));
         std::uint64_t const bit = std::uint64_t{1} << index;
@@ -166,6 +173,7 @@ void SchedulerCore::releaseTask(Task &task) noexcept {
 
     stack::StackView const stack = task.stack;
     stack::StackAllocator *const stackAllocator = task.allocator;
+    coro::detail::tsanDestroyFiber(task);
     task.~Task();
     stackAllocator->deallocate(stack);
     releaseSlot(*this, slot);
