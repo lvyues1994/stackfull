@@ -1,0 +1,128 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": { "major": 3, "minor": 21, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": true,
+        "STACKFULL_BUILD_TESTS": true,
+        "STACKFULL_BUILD_BENCH": true
+      }
+    },
+    {
+      "name": "debug",
+      "inherits": "base",
+      "displayName": "Linux x86_64 Debug",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+    },
+    {
+      "name": "release",
+      "inherits": "base",
+      "displayName": "Linux x86_64 Release",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+    },
+    {
+      "name": "asan",
+      "inherits": "debug",
+      "displayName": "Linux x86_64 Debug + AddressSanitizer",
+      "cacheVariables": { "STACKFULL_SANITIZE": "address" }
+    },
+    {
+      "name": "noexc",
+      "inherits": "release",
+      "displayName": "Linux x86_64 Release, -fno-exceptions",
+      "cacheVariables": { "STACKFULL_EXCEPTIONS": false }
+    },
+    {
+      "name": "pthread-tls",
+      "inherits": "release",
+      "displayName": "Linux x86_64 Release, pthread_key TLS backend",
+      "cacheVariables": { "STACKFULL_TLS_BACKEND": "PTHREAD_KEY" }
+    },
+    {
+      "name": "clang-release",
+      "inherits": "release",
+      "displayName": "Linux x86_64 Release (clang)",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "clang",
+        "CMAKE_CXX_COMPILER": "clang++"
+      }
+    },
+    {
+      "name": "cross-base",
+      "hidden": true,
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "STACKFULL_BUILD_TESTS": false,
+        "STACKFULL_BUILD_BENCH": true
+      }
+    },
+    {
+      "name": "android-arm64",
+      "inherits": "cross-base",
+      "displayName": "Android arm64-v8a, API 29 (ELF TLS)",
+      "toolchainFile": "$env{ANDROID_NDK_HOME}/build/cmake/android.toolchain.cmake",
+      "cacheVariables": {
+        "ANDROID_ABI": "arm64-v8a",
+        "ANDROID_PLATFORM": "android-29",
+        "ANDROID_STL": "c++_static"
+      }
+    },
+    {
+      "name": "android-arm64-api24",
+      "inherits": "android-arm64",
+      "displayName": "Android arm64-v8a, API 24 (emulated TLS → pthread_key backend)",
+      "cacheVariables": { "ANDROID_PLATFORM": "android-24" }
+    },
+    {
+      "name": "android-armv7",
+      "inherits": "cross-base",
+      "displayName": "Android armeabi-v7a, API 24",
+      "toolchainFile": "$env{ANDROID_NDK_HOME}/build/cmake/android.toolchain.cmake",
+      "cacheVariables": {
+        "ANDROID_ABI": "armeabi-v7a",
+        "ANDROID_PLATFORM": "android-24",
+        "ANDROID_STL": "c++_static"
+      }
+    },
+    {
+      "name": "qnx-aarch64le",
+      "inherits": "cross-base",
+      "displayName": "QNX aarch64le (qcc; source qnxsdp-env.sh first)",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/qnx.cmake",
+      "cacheVariables": { "STACKFULL_QNX_ARCH": "aarch64le" }
+    },
+    {
+      "name": "qnx-x86_64",
+      "inherits": "qnx-aarch64le",
+      "displayName": "QNX x86_64 (qcc)",
+      "cacheVariables": { "STACKFULL_QNX_ARCH": "x86_64" }
+    }
+  ],
+  "buildPresets": [
+    { "name": "debug", "configurePreset": "debug" },
+    { "name": "release", "configurePreset": "release" },
+    { "name": "asan", "configurePreset": "asan" },
+    { "name": "noexc", "configurePreset": "noexc" },
+    { "name": "pthread-tls", "configurePreset": "pthread-tls" },
+    { "name": "clang-release", "configurePreset": "clang-release" },
+    { "name": "android-arm64", "configurePreset": "android-arm64" },
+    { "name": "android-arm64-api24", "configurePreset": "android-arm64-api24" },
+    { "name": "android-armv7", "configurePreset": "android-armv7" },
+    { "name": "qnx-aarch64le", "configurePreset": "qnx-aarch64le" },
+    { "name": "qnx-x86_64", "configurePreset": "qnx-x86_64" }
+  ],
+  "testPresets": [
+    { "name": "debug", "configurePreset": "debug", "output": { "outputOnFailure": true } },
+    { "name": "release", "configurePreset": "release", "output": { "outputOnFailure": true } },
+    { "name": "asan", "configurePreset": "asan", "output": { "outputOnFailure": true } },
+    { "name": "noexc", "configurePreset": "noexc", "output": { "outputOnFailure": true } },
+    { "name": "pthread-tls", "configurePreset": "pthread-tls", "output": { "outputOnFailure": true } },
+    { "name": "clang-release", "configurePreset": "clang-release", "output": { "outputOnFailure": true } }
+  ]
+}

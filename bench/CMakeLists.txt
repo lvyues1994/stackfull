@@ -1,0 +1,2 @@
+add_executable(stackfull_switch_bench SwitchBench.cpp)
+target_link_libraries(stackfull_switch_bench PRIVATE stackfull::coro stackfull_warnings)
