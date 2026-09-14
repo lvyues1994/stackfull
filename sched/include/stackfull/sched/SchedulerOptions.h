@@ -13,6 +13,8 @@
 namespace stackfull {
 namespace sched {
 
+struct Driver;
+
 #if STACKFULL_HAS_EXCEPTIONS
 // Receives exceptions that escape a *detached* task (a joinable task's
 // exception is rethrown by join() instead). The default aborts the process,
@@ -33,6 +35,9 @@ struct SchedulerOptions {
     std::size_t taskStackSize = std::size_t{128} * 1024;
     // Borrowed; nullptr selects stack::defaultStackAllocator().
     stack::StackAllocator *allocator = nullptr;
+    // Borrowed event source (the IO layer's Poller). nullptr: idle workers
+    // sleep on futex/condvar only; timers still work.
+    Driver *driver = nullptr;
 #if STACKFULL_HAS_EXCEPTIONS
     // Borrowed; nullptr selects the aborting default.
     ExceptionSink *exceptionSink = nullptr;

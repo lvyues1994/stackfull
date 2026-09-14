@@ -54,6 +54,8 @@ struct Worker {
     Task *spinForWork() noexcept;
     // Sleeps until notified; returns work found before or instead of sleeping.
     Task *parkIdle() noexcept;
+    void sleepIdle() noexcept;
+    void maintain() noexcept;
     void reapParkedTasks() noexcept;
 
     SchedulerCore &core;

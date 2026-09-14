@@ -66,7 +66,7 @@ struct SchedulerImpl final : Scheduler {
         }
         core_.wakeAllParked();
         for (auto const &worker : core_.workers) {
-            worker->parker->unpark();
+            core_.unparkWorker(*worker);
         }
     }
 

@@ -2,6 +2,7 @@
 
 #include <stackfull/sched/Parker.h>
 #include <stackfull/sched/WakeToken.h>
+#include <stackfull/sync/SpinLock.h>
 
 #include <atomic>
 
@@ -17,9 +18,13 @@ namespace detail {
 //
 // Lifetime rule: the notifier may touch the Waiter only until it has called
 // wake()/unpark(); right after that the waiter may return and the object dies.
+// A waiter that leaves early (forced unwind at Scheduler::stop()) must first
+// unlink itself under the primitive's lock — see WaitGuard.
 struct Waiter {
     Waiter *next = nullptr;
     Waiter *prev = nullptr;
+    // Maintained by WaitList under the owning primitive's lock.
+    bool linked = false;
     std::atomic<bool> satisfied{false};
 
     // Exactly one of the two is set.
@@ -31,8 +36,9 @@ struct Waiter {
     Waiter(Waiter const &) = delete;
     Waiter &operator=(Waiter const &) = delete;
 
-    // Blocks the current task or thread until notify().
-    void wait() noexcept;
+    // Blocks the current task or thread until notify(). Not noexcept: a
+    // forced unwind is thrown at the park inside.
+    void wait();
 
     // Called by the notifier after unlinking the waiter.
     void notify() noexcept {
@@ -46,6 +52,10 @@ struct Waiter {
             t.wake();
         }
     }
+
+    // A notifier that already unlinked us is about to write `satisfied`;
+    // wait for that so the object may be destroyed safely.
+    void awaitNotifier() noexcept;
 };
 
 // Intrusive FIFO of waiters. Not synchronized: callers hold the owning
@@ -56,6 +66,7 @@ struct WaitList {
     void pushBack(Waiter &waiter) noexcept {
         waiter.next = nullptr;
         waiter.prev = tail;
+        waiter.linked = true;
         if (tail != nullptr) {
             tail->next = &waiter;
         } else {
@@ -85,11 +96,62 @@ struct WaitList {
         }
         waiter.next = nullptr;
         waiter.prev = nullptr;
+        waiter.linked = false;
     }
 
 private:
     Waiter *head = nullptr;
     Waiter *tail = nullptr;
+};
+
+// Scope guard for a wait on a WaitList. Armed by default; disarm() once the
+// wait completed normally. If the scope is left otherwise (forced unwind)
+// the destructor removes the waiter under the lock, or — when a notifier
+// already took it — waits for that notifier to finish with the object.
+// `onUnlinked` runs under the lock right after an unlink (e.g. to fix a
+// waiter counter).
+template <class OnUnlinked>
+struct WaitGuard {
+    WaitGuard(SpinLock &lock_, WaitList &list_, Waiter &waiter_, OnUnlinked onUnlinked_) noexcept
+        : lock(lock_), list(list_), waiter(waiter_), onUnlinked(onUnlinked_) {}
+    WaitGuard(WaitGuard const &) = delete;
+    WaitGuard &operator=(WaitGuard const &) = delete;
+
+    ~WaitGuard() {
+        if (not armed) {
+            return;
+        }
+        bool wasLinked = false;
+        {
+            SpinLockGuard const guard(lock);
+            wasLinked = waiter.linked;
+            if (wasLinked) {
+                list.unlink(waiter);
+                onUnlinked();
+            }
+        }
+        if (not wasLinked) {
+            waiter.awaitNotifier();
+        }
+    }
+
+    void disarm() noexcept { armed = false; }
+
+private:
+    SpinLock &lock;
+    WaitList &list;
+    Waiter &waiter;
+    OnUnlinked onUnlinked;
+    bool armed = true;
+};
+
+// Usage (C++14 has no guaranteed elision, so construct in place):
+//   auto fixCount = [&] { waiterCount.fetch_sub(1); };
+//   detail::WaitGuard<decltype(fixCount)> guard(lock, waiters, waiter, fixCount);
+//   waiter.wait();
+//   guard.disarm();
+struct NoOp {
+    void operator()() const noexcept {}
 };
 
 } // namespace detail

@@ -55,7 +55,9 @@ struct Channel {
             detail::Waiter waiter;
             senders.pushBack(waiter);
             lock.unlock();
+            detail::WaitGuard<detail::NoOp> unlinkOnUnwind(lock, senders, waiter, detail::NoOp{});
             waiter.wait();
+            unlinkOnUnwind.disarm();
         }
     }
 
@@ -91,7 +93,9 @@ struct Channel {
             detail::Waiter waiter;
             receivers.pushBack(waiter);
             lock.unlock();
+            detail::WaitGuard<detail::NoOp> unlinkOnUnwind(lock, receivers, waiter, detail::NoOp{});
             waiter.wait();
+            unlinkOnUnwind.disarm();
         }
     }
 

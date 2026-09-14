@@ -43,7 +43,11 @@ void Semaphore::acquireSlow() {
         }
         waiters.pushBack(waiter);
     }
+    // Leaving through a forced unwind: drop out of the list (and the count).
+    auto const fixCount = [this] { waiterCount.fetch_sub(1, std::memory_order_seq_cst); };
+    detail::WaitGuard<decltype(fixCount)> unlinkOnUnwind(lock, waiters, waiter, fixCount);
     waiter.wait(); // a permit was taken on our behalf by release()
+    unlinkOnUnwind.disarm();
 }
 
 void Semaphore::release() noexcept {

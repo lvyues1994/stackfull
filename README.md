@@ -6,7 +6,7 @@
 
 ```
 ┌───────────────────────────────────────────────────────────┐
-│ L4b io          Poller 实现 Parker · 定时器 · fd 包装          │  规划中
+│ L4b io          Poller(Driver) epoll/poll · 定时器 · fd 包装   │  ✔
 ├───────────────────────────────────────────────────────────┤
 │ L4a sync        Semaphore · Mutex · CondVar · WaitGroup ·     │  ✔
 │                 Channel<T>（任务与普通线程都能用）              │
@@ -23,7 +23,7 @@
 └───────────────────────────────────────────────────────────┘
 ```
 
-每层一个 CMake target：`stackfull::fcontext`、`stackfull::stack`、`stackfull::coro`、`stackfull::queue`（无锁队列，header-only）、`stackfull::sched`、`stackfull::sync`；`stackfull::stackfull` 是聚合目标。
+每层一个 CMake target：`stackfull::fcontext`、`stackfull::stack`、`stackfull::coro`、`stackfull::queue`（无锁队列，header-only）、`stackfull::sched`、`stackfull::sync`、`stackfull::io`；`stackfull::stackfull` 是聚合目标。
 
 ## 使用
 
@@ -120,6 +120,47 @@ done.wait();                                    // 主线程：阻塞在线程 P
 - `Semaphore` 是核心（快路径允许插队，多余许可按 FIFO 移交等待者），`Mutex` 是二元信号量。`Channel<T>` 有界 MPMC，`close()` 唤醒所有阻塞方。
 - 语义与 std 一致：`ConditionVariable::wait` 可能虚假返回，按谓词循环；`Mutex` 非递归。
 
+## 定时器与 IO
+
+```cpp
+#include <stackfull/io/Poller.h>
+#include <stackfull/io/Registration.h>
+#include <stackfull/io/Async.h>
+#include <stackfull/io/Tcp.h>
+#include <stackfull/sched/Sleep.h>
+
+auto poller = io::makeDefaultPoller();        // Linux/Android: epoll；其他：poll
+SchedulerOptions options;
+options.driver = poller.get();                // 空闲 worker 睡在 epoll_wait 里而不是 futex
+auto scheduler = makeScheduler(options);
+
+scheduler->spawn([&] {
+    this_task::sleepFor(std::chrono::milliseconds{10});   // 任务挂起，worker 空出来
+
+    auto listener = io::listenTcpLoopback();
+    io::Registration acceptor(*poller, listener.fd.get());
+    for (;;) {
+        io::AcceptResult client = io::accept(acceptor);    // EAGAIN → park 到就绪
+        int const fd = client.fd.release();
+        scheduler->spawn([fd, &poller] {
+            io::Fd connection{fd};
+            io::Registration registration(*poller, connection.get());   // 先注册、后关闭（析构顺序）
+            char buffer[4096];
+            for (;;) {
+                io::IoResult const got = io::read(registration, buffer, sizeof buffer);
+                if (not got or got.bytes == 0) return;
+                io::writeAll(registration, buffer, got.bytes);
+            }
+        });
+    }
+});
+```
+
+- **timekeeper**：任一时刻只有一个空闲 worker 以最早的定时器为超时睡在 `Driver::wait()`（有 Driver 时即 `epoll_wait`）里，并负责触发到期定时器；其他空闲 worker 睡自己的 futex。新定时器若成为最早的会打断 timekeeper 重算超时。忙碌的 worker 每 61 次分派做一次维护：触发定时器并对 Driver 做一次非阻塞轮询，所以全忙时 IO 也不会饿死。
+- 就绪是**一次性**的：每次 `waitReadable/Writable` 重新 arm，没人等的 fd 零开销。事件携带 fd 号而非指针，分派时在锁下查表，`Registration` 析构后的迟到事件只会查不到，不会解引用。
+- `Registration` 的等待者和 `sync` 原语一样是栈上侵入式节点，任务与普通线程都能用；`io::read/write/accept/connect` 在 `EAGAIN` 时挂起调用者。
+- `Scheduler::stop()` 的 `ForcedUnwind` 会穿过所有阻塞点：每个 park 点都有摘链守卫（`WaitGuard` / 定时器 `cancel` / `Registration::detach`），并处理"通知方刚摘走、尚未写完 `satisfied`"的窗口。任何包含 `park()` 的函数都不能是 `noexcept`。
+
 ## 构建
 
 ```sh
@@ -162,6 +203,9 @@ gcc 13 -O3；Android 列为小米 25091RP04C（arm64，Android 16）上 NDK r28 
 | `Mutex` lock+unlock，8 任务 / 4 workers 争用 | 366 ns | 450 ns |
 | `Channel<long>` 容量 64，1P/1C，2 workers | 15 ns | 51 ns |
 | `Channel<long>` 容量 1，1P/1C，2 workers | 90 ns | 268 ns |
+| TCP loopback echo 往返（1 字节，epoll，2 workers） | 8.1 µs | 30 µs |
+| TCP loopback echo 往返（poll 后端） | 8.9 µs | 38 µs |
+| 100 任务并发 `sleepFor(200µs)`，每个定时器分摊 | 2.6 µs | 2.8 µs |
 
 切换路径上的所有函数（`resume/yield`、`switchTo/onArrival`、`this_task::yield/park`）强制内联：栈切换后返回地址预测器失效，每多一层 `ret` 就多一次约 5 ns 的错误预测；GCC 自己不会内联这些"太大"的函数，实测 34 → 15.8 ns。
 
@@ -177,6 +221,12 @@ gcc 13 -O3；Android 列为小米 25091RP04C（arm64，Android 16）上 NDK r28 
 同步原语：
 
 - 唤醒协议的 Dekker 配对必须"先宣告、后检查"：`Semaphore::acquireSlow` 若先看 `permits` 再加 `waiterCount`，与释放方的"先加许可再看 `waiterCount`"不构成 SB 对，大约每两次运行丢一次唤醒（已修复并有测试覆盖）。写新原语时保持这个顺序。
+
+IO 与定时器：
+
+- `Registration` 必须在 fd 关闭之前析构（声明顺序：先 `Fd`、后 `Registration`）。
+- `ConditionVariable::wait` 被强制展开时只能 `tryLock` 尽力重新持锁；持锁方若也在被回收则互斥量状态未定义——这只发生在 `stop()`。
+- `sleepFor` 只能在任务内调用；1 个 worker 且任务从不 `yield` 时定时器无法触发（协作式无抢占）。
 
 协程层：
 

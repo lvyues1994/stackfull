@@ -1,0 +1,52 @@
+#pragma once
+
+#include <stackfull/sched/Driver.h>
+
+#include <cstdint>
+#include <memory>
+#include <system_error>
+
+namespace stackfull {
+namespace io {
+
+struct Registration;
+
+// Readiness directions. Bit flags.
+enum class Interest : std::uint8_t {
+    None = 0,
+    Readable = 1,
+    Writable = 2,
+};
+
+inline Interest operator|(Interest const a, Interest const b) noexcept {
+    return static_cast<Interest>(static_cast<std::uint8_t>(a) | static_cast<std::uint8_t>(b));
+}
+inline bool has(Interest const set, Interest const bit) noexcept {
+    return (static_cast<std::uint8_t>(set) & static_cast<std::uint8_t>(bit)) != 0;
+}
+
+// OS readiness multiplexer. Implements sched::Driver so the scheduler's
+// timekeeper worker sleeps inside wait() and readiness turns straight into
+// task wakeups; other threads may register descriptors concurrently.
+//
+// Readiness is *one-shot*: after an event is delivered for a descriptor the
+// poller stops watching it until the next arm(). Registration::waitReadable /
+// waitWritable arm on every wait, so a descriptor that nobody waits on
+// costs nothing.
+struct Poller : sched::Driver {
+    // Start tracking `registration.fd()` with no interest yet.
+    virtual std::error_code add(Registration &registration) noexcept = 0;
+    // Stop tracking; after this returns no further readiness is delivered.
+    virtual void remove(Registration &registration) noexcept = 0;
+    // Watch `interest` until the next event for this descriptor.
+    virtual std::error_code arm(Registration &registration, Interest interest) noexcept = 0;
+};
+
+#if defined(__linux__)
+std::unique_ptr<Poller> makeEpollPoller(); // Linux, Android
+#endif
+std::unique_ptr<Poller> makePollPoller();    // poll(2): QNX and everything else
+std::unique_ptr<Poller> makeDefaultPoller(); // epoll where available, else poll
+
+} // namespace io
+} // namespace stackfull

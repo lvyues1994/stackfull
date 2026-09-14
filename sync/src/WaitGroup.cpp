@@ -42,7 +42,9 @@ void WaitGroup::wait() {
         }
         waiters.pushBack(waiter);
     }
+    detail::WaitGuard<detail::NoOp> unlinkOnUnwind(lock, waiters, waiter, detail::NoOp{});
     waiter.wait();
+    unlinkOnUnwind.disarm();
 }
 
 } // namespace sync

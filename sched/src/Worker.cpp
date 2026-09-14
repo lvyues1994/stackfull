@@ -61,6 +61,7 @@ void Worker::run() {
     for (;;) {
         Task *task = nullptr;
         if ((tick % kInjectionCheckPeriod) == 0) {
+            maintain();
             task = core.popInjection();
         }
         if (task == nullptr) {
@@ -213,13 +214,57 @@ Task *Worker::parkIdle() noexcept {
         return task;
     }
 
-    if (core.stopping.load(std::memory_order_acquire)) {
-        parker->parkFor(std::chrono::milliseconds{1}); // re-scan for parked tasks
-    } else {
-        parker->park();
-    }
+    sleepIdle();
     core.clearIdle(*this);
     return nullptr;
+}
+
+// Periodic upkeep on a busy worker: fire due timers and, if nobody is
+// sleeping in the Driver, give it a non-blocking poll so IO readiness is
+// noticed even when every worker is busy.
+void Worker::maintain() noexcept {
+    core.fireTimers();
+    if (core.driver != nullptr and core.tryBecomeTimekeeper(*this)) {
+        core.driver->wait(std::chrono::nanoseconds{0});
+        core.releaseTimekeeper(*this);
+    }
+}
+
+// The actual sleep of an idle worker. One worker becomes the timekeeper and
+// sleeps with the earliest timer as timeout — inside the Driver when there
+// is one — then fires what came due; the others sleep on their Parker until
+// notified.
+void Worker::sleepIdle() noexcept {
+    bool const stopping = core.stopping.load(std::memory_order_acquire);
+    if (not core.tryBecomeTimekeeper(*this)) {
+        if (stopping) {
+            parker->parkFor(std::chrono::milliseconds{1}); // re-scan for parked tasks
+        } else {
+            parker->park();
+        }
+        return;
+    }
+
+    std::chrono::nanoseconds timeout{-1};
+    TimePoint deadline;
+    if (core.timers.nextDeadline(deadline)) {
+        auto const now = std::chrono::steady_clock::now();
+        timeout = deadline > now ? std::chrono::duration_cast<std::chrono::nanoseconds>(deadline - now)
+                                 : std::chrono::nanoseconds{0};
+    }
+    if (stopping and (timeout < std::chrono::nanoseconds{0} or timeout > std::chrono::milliseconds{1})) {
+        timeout = std::chrono::milliseconds{1};
+    }
+
+    if (core.driver != nullptr) {
+        core.driver->wait(timeout);
+    } else if (timeout < std::chrono::nanoseconds{0}) {
+        parker->park();
+    } else {
+        parker->parkFor(timeout);
+    }
+    core.releaseTimekeeper(*this);
+    core.fireTimers();
 }
 
 // Shutdown: claim every task still parked and end it. With exceptions the

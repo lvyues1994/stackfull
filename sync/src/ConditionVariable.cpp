@@ -3,6 +3,26 @@
 namespace stackfull {
 namespace sync {
 
+namespace {
+
+// Forced unwind out of wait(): the caller's guard will unlock the mutex, so
+// try to hold it again. Parking here is not an option (the unwinder would
+// find us Parked a second time), so this is best effort: if another dying
+// task holds the mutex we give up and the mutex ends in an inconsistent
+// state — acceptable only because it happens at Scheduler::stop().
+struct RelockOnUnwind {
+    Mutex &mutex;
+    bool armed = true;
+    ~RelockOnUnwind() {
+        if (armed) {
+            for (unsigned spins = 0; spins < 1024 and not mutex.tryLock(); ++spins) {
+            }
+        }
+    }
+};
+
+} // namespace
+
 void ConditionVariable::wait(Mutex &mutex) {
     detail::Waiter waiter;
     {
@@ -12,7 +32,13 @@ void ConditionVariable::wait(Mutex &mutex) {
     // Registered before the mutex is released: a notifier that changes the
     // condition under the mutex cannot miss us.
     mutex.unlock();
-    waiter.wait();
+    {
+        RelockOnUnwind relock{mutex};
+        detail::WaitGuard<detail::NoOp> unlinkOnUnwind(lock, waiters, waiter, detail::NoOp{});
+        waiter.wait();
+        unlinkOnUnwind.disarm();
+        relock.armed = false;
+    }
     mutex.lock();
 }
 

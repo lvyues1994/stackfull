@@ -10,3 +10,6 @@ target_link_libraries(stackfull_sched_bench PRIVATE stackfull::sched stackfull_w
 
 add_executable(stackfull_sync_bench SyncBench.cpp)
 target_link_libraries(stackfull_sync_bench PRIVATE stackfull::sync stackfull_warnings)
+
+add_executable(stackfull_io_bench IoBench.cpp)
+target_link_libraries(stackfull_io_bench PRIVATE stackfull::io stackfull::sync stackfull_warnings)

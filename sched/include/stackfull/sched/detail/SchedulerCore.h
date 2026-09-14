@@ -4,8 +4,10 @@
 #include <stackfull/queue/BbqQueue.h>
 #include <stackfull/queue/BwosQueue.h>
 #include <stackfull/queue/RingQueue.h>
+#include <stackfull/sched/Driver.h>
 #include <stackfull/sched/SchedulerOptions.h>
 #include <stackfull/sched/detail/Task.h>
+#include <stackfull/sched/detail/TimerQueue.h>
 #include <stackfull/stack/StackAllocator.h>
 
 #include <atomic>
@@ -72,6 +74,20 @@ struct SchedulerCore {
     // Wake every parked task once (cooperative shutdown), from any thread.
     void wakeAllParked() noexcept;
 
+    // --- timers / driver -----------------------------------------------------
+    // Exactly one idle worker at a time sleeps with the earliest timer as its
+    // timeout (inside the Driver when there is one); the others sleep
+    // indefinitely on their Parker.
+    bool tryBecomeTimekeeper(Worker &worker) noexcept;
+    void releaseTimekeeper(Worker &worker) noexcept;
+    // Unpark a worker wherever it sleeps: its Parker, or the Driver if it is
+    // the timekeeper inside Driver::wait().
+    void unparkWorker(Worker &worker) noexcept;
+    // Queue a deadline; shortens the timekeeper's sleep if it became earliest.
+    void addTimer(TimerEntry &entry) noexcept;
+    // Fire what is due; any worker may call this.
+    void fireTimers() noexcept;
+
     SchedulerOptions options;
     stack::StackAllocator *allocator = nullptr;
 #if STACKFULL_HAS_EXCEPTIONS
@@ -89,6 +105,10 @@ struct SchedulerCore {
     std::atomic<std::uint32_t> liveTasks{0};
     std::atomic<std::uint32_t> workersRunning{0};
     std::atomic<bool> stopping{false};
+
+    Driver *driver = nullptr;
+    TimerQueue timers;
+    std::atomic<Worker *> timekeeper{nullptr};
 };
 
 } // namespace detail

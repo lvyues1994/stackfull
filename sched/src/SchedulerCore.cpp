@@ -11,6 +11,7 @@
 #include <stackfull/stack/DefaultStackAllocator.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <thread>
@@ -63,6 +64,7 @@ SchedulerCore::SchedulerCore(SchedulerOptions const &options_) : options(options
     STACKFULL_CHECK(options.maxTasks >= 1 and options.maxTasks <= SlotQueue::kCapacity,
                     "stackfull: SchedulerOptions::maxTasks out of range for the injection queue");
     allocator = options.allocator != nullptr ? options.allocator : &stack::defaultStackAllocator();
+    driver = options.driver;
 #if STACKFULL_HAS_EXCEPTIONS
     exceptionSink = options.exceptionSink != nullptr ? options.exceptionSink : &abortingExceptionSink();
 #endif
@@ -106,7 +108,7 @@ void SchedulerCore::notifyIdleWorker() noexcept {
         auto const index = static_cast<std::size_t>(__builtin_ctzll(mask));
         std::uint64_t const bit = std::uint64_t{1} << index;
         if (idleMask.compare_exchange_weak(mask, mask & ~bit, std::memory_order_acq_rel)) {
-            workers[index]->parker->unpark();
+            unparkWorker(*workers[index]);
             return;
         }
     }
@@ -114,9 +116,45 @@ void SchedulerCore::notifyIdleWorker() noexcept {
 
 void SchedulerCore::notifyWorker(Worker &worker) noexcept {
     if (clearIdle(worker)) {
-        worker.parker->unpark();
+        unparkWorker(worker);
     }
     // Otherwise it is running and will drain its inbox at the next switch.
+}
+
+bool SchedulerCore::tryBecomeTimekeeper(Worker &worker) noexcept {
+    Worker *expected = nullptr;
+    return timekeeper.compare_exchange_strong(expected, &worker, std::memory_order_seq_cst);
+}
+
+void SchedulerCore::releaseTimekeeper(Worker &worker) noexcept {
+    Worker *expected = &worker;
+    timekeeper.compare_exchange_strong(expected, nullptr, std::memory_order_seq_cst);
+}
+
+void SchedulerCore::unparkWorker(Worker &worker) noexcept {
+    // The timekeeper may be asleep inside the Driver rather than its Parker;
+    // poke both — a surplus Parker token only makes a later park() return
+    // early once.
+    if (driver != nullptr and timekeeper.load(std::memory_order_seq_cst) == &worker) {
+        driver->wake();
+    }
+    worker.parker->unpark();
+}
+
+void SchedulerCore::addTimer(TimerEntry &entry) noexcept {
+    if (not timers.add(entry)) {
+        return;
+    }
+    // New earliest deadline: whoever is sleeping with the old timeout must
+    // recompute. The timer lock orders this against the timekeeper reading
+    // the heap after claiming the role.
+    if (Worker *const keeper = timekeeper.load(std::memory_order_seq_cst)) {
+        unparkWorker(*keeper);
+    }
+}
+
+void SchedulerCore::fireTimers() noexcept {
+    timers.fireExpired(std::chrono::steady_clock::now());
 }
 
 void SchedulerCore::markIdle(Worker &worker) noexcept {
@@ -180,7 +218,7 @@ void SchedulerCore::releaseTask(Task &task) noexcept {
 
     if (liveTasks.fetch_sub(1, std::memory_order_acq_rel) == 1 and stopping.load(std::memory_order_acquire)) {
         for (auto const &worker : workers) {
-            worker->parker->unpark(); // let everyone observe "no tasks left" and exit
+            unparkWorker(*worker); // let everyone observe "no tasks left" and exit
         }
     }
 }
