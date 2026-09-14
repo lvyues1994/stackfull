@@ -112,7 +112,7 @@ void contextEntry(fcontext::transfer_t transfer);
 // Hot path (see the note on resume() above).
 // ---------------------------------------------------------------------------
 
-inline void Coroutine::resume() {
+STACKFULL_ALWAYS_INLINE void Coroutine::resume() {
     STACKFULL_CHECK(block != nullptr, "stackfull: resume() on an empty handle");
     STACKFULL_CHECK(block->state == CoroutineState::Created or block->state == CoroutineState::Suspended,
                     "stackfull: resume() requires a Created or Suspended coroutine");
@@ -129,7 +129,7 @@ inline void Coroutine::resume() {
 #endif
 }
 
-inline void Coroutine::yield() {
+STACKFULL_ALWAYS_INLINE void Coroutine::yield() {
     ThreadState &thread = detail::currentThreadState();
     detail::ContextBlock &self = *thread.current;
     STACKFULL_CHECK(not detail::isNativeContext(thread, self), "stackfull: yield() outside a coroutine");

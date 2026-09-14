@@ -36,16 +36,20 @@ inline std::uintptr_t alignDown(std::uintptr_t const value, std::size_t const al
     return value & ~(static_cast<std::uintptr_t>(alignment) - 1);
 }
 
+// `blockSize` / `blockAlign` describe the control record: ContextBlock itself
+// for a plain coroutine, or a derived record (the scheduler's Task).
 inline StackLayout carveStack(stack::StackView const &stack, std::size_t const entrySize,
-                              std::size_t const entryAlign) noexcept {
+                              std::size_t const entryAlign, std::size_t const blockSize,
+                              std::size_t const blockAlign) noexcept {
     std::size_t const stackAlign = 16;
     std::size_t const align = entryAlign > stackAlign ? entryAlign : stackAlign;
+    std::size_t const recordAlign = blockAlign > stackAlign ? blockAlign : stackAlign;
 
     auto const top = reinterpret_cast<std::uintptr_t>(stack::topOf(stack));
     auto const base = reinterpret_cast<std::uintptr_t>(stack.base);
 
     std::uintptr_t const entryAddr = alignDown(top - entrySize, align);
-    std::uintptr_t const blockAddr = alignDown(entryAddr - sizeof(ContextBlock), alignof(ContextBlock));
+    std::uintptr_t const blockAddr = alignDown(entryAddr - blockSize, recordAlign);
 
     StackLayout layout;
     layout.fits = entryAddr <= top and blockAddr < entryAddr and blockAddr > base and
@@ -58,6 +62,11 @@ inline StackLayout carveStack(stack::StackView const &stack, std::size_t const e
     layout.stackTop = reinterpret_cast<void *>(blockAddr);
     layout.usableSize = static_cast<std::size_t>(blockAddr - base);
     return layout;
+}
+
+inline StackLayout carveStack(stack::StackView const &stack, std::size_t const entrySize,
+                              std::size_t const entryAlign) noexcept {
+    return carveStack(stack, entrySize, entryAlign, sizeof(ContextBlock), alignof(ContextBlock));
 }
 
 } // namespace detail

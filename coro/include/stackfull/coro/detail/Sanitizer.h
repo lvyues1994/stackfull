@@ -18,7 +18,7 @@ namespace detail {
 
 // Called on the departing side, right before the jump. `fromWillResume == false`
 // tells ASan the departing fiber is gone for good so its fake stack is freed.
-inline void asanStartSwitch(ContextBlock &from, ContextBlock const &to, bool const fromWillResume) noexcept {
+STACKFULL_ALWAYS_INLINE void asanStartSwitch(ContextBlock &from, ContextBlock const &to, bool const fromWillResume) noexcept {
 #if STACKFULL_HAS_ASAN
     __sanitizer_start_switch_fiber(fromWillResume ? &from.asanFakeStack : nullptr, to.asanBottom, to.asanSize);
 #else
@@ -31,7 +31,7 @@ inline void asanStartSwitch(ContextBlock &from, ContextBlock const &to, bool con
 // Called on the arriving side. ASan reports the bounds of the stack we came
 // from; a thread's native stack has no other way to learn them, so record them
 // the first time that thread switches away.
-inline void asanFinishSwitch(ContextBlock &self, ContextBlock &prev) noexcept {
+STACKFULL_ALWAYS_INLINE void asanFinishSwitch(ContextBlock &self, ContextBlock &prev) noexcept {
 #if STACKFULL_HAS_ASAN
     void const *bottomOld = nullptr;
     std::size_t sizeOld = 0;

@@ -1,9 +1,12 @@
 #include <stackfull/stack/PooledStackAllocator.h>
 
 #include <stackfull/stack/MmapStackAllocator.h>
+#include <stackfull/queue/BbqQueue.h>
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdlib>
+#include <new>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -31,6 +34,11 @@ struct SizeClass {
 // upstream allocator for the extra sizes.
 constexpr std::size_t kMaxSizeClasses = 8;
 
+// Shared tier: lock-free MPMC of whole stacks, any size class mixed. A
+// consumer that pops a stack of the wrong size hands it back to its own
+// thread cache (or upstream) and tries again a bounded number of times.
+using SharedPool = queue::BbqQueue<StackView, 4, 512>;
+
 struct PooledStackAllocatorImpl;
 
 struct ThreadCache {
@@ -52,6 +60,20 @@ StackView viewOf(FreeNode *const node, std::size_t const size) noexcept {
 }
 
 struct PooledStackAllocatorImpl final : StackAllocator {
+    // The shared pool has alignas(64) members; C++14 `new` guarantees less.
+    static void *operator new(std::size_t const size) {
+        void *memory = nullptr;
+        if (::posix_memalign(&memory, alignof(SharedPool), size) != 0) {
+#if defined(__cpp_exceptions) || defined(__EXCEPTIONS)
+            throw std::bad_alloc{};
+#else
+            std::abort();
+#endif
+        }
+        return memory;
+    }
+    static void operator delete(void *const memory) noexcept { std::free(memory); }
+
     PooledStackAllocatorImpl(StackAllocator &upstream_, PooledStackOptions const &options_) noexcept
         : upstream(upstream_), options(options_), page(pageSize()) {
         keyValid = ::pthread_key_create(&key, &PooledStackAllocatorImpl::onThreadExit) == 0;
@@ -68,6 +90,10 @@ struct PooledStackAllocatorImpl final : StackAllocator {
             drainToUpstream(*owned);
         }
         registry.clear();
+        StackView leftover;
+        while (shared.pop(leftover) == queue::PopStatus::Ok) {
+            upstream.deallocate(leftover);
+        }
     }
 
     StackAllocation allocate(std::size_t const size) noexcept override {
@@ -79,6 +105,10 @@ struct PooledStackAllocatorImpl final : StackAllocator {
                 return StackAllocation{popFront(*cache, *sizeClass), std::error_code{}};
             }
         }
+        StackView fromShared;
+        if (takeFromShared(rounded, fromShared, cache)) {
+            return StackAllocation{fromShared, std::error_code{}};
+        }
         return upstream.allocate(rounded);
     }
 
@@ -87,16 +117,16 @@ struct PooledStackAllocatorImpl final : StackAllocator {
             return;
         }
         ThreadCache *const cache = currentCache();
-        if (cache == nullptr or not canCache(*cache, stack)) {
-            upstream.deallocate(stack);
-            return;
+        if (cache != nullptr and canCache(*cache, stack)) {
+            SizeClass *const sizeClass = findOrAddClass(*cache, stack.size);
+            if (sizeClass != nullptr) {
+                pushFront(*cache, *sizeClass, stack);
+                return;
+            }
         }
-        SizeClass *const sizeClass = findOrAddClass(*cache, stack.size);
-        if (sizeClass == nullptr) {
+        if (not giveToShared(stack)) {
             upstream.deallocate(stack);
-            return;
         }
-        pushFront(*cache, *sizeClass, stack);
     }
 
 private:
@@ -148,6 +178,47 @@ private:
         cache.cachedStacks -= 1;
         cache.cachedBytes -= sizeClass.size;
         return viewOf(node, sizeClass.size);
+    }
+
+    bool giveToShared(StackView const &stack) noexcept {
+        for (unsigned spins = 0; spins < 8; ++spins) {
+            queue::PushStatus const status = shared.push(stack);
+            if (status == queue::PushStatus::Ok) {
+                return true;
+            }
+            if (status == queue::PushStatus::Full) {
+                return false;
+            }
+        }
+        return false;
+    }
+
+    // Pops from the shared tier until a stack of `size` shows up. Stacks of
+    // other sizes are parked in the local cache (or returned upstream) so the
+    // scan terminates.
+    bool takeFromShared(std::size_t const size, StackView &out, ThreadCache *const cache) noexcept {
+        for (unsigned attempts = 0; attempts < 4; ++attempts) {
+            StackView candidate;
+            queue::PopStatus const status = shared.pop(candidate);
+            if (status == queue::PopStatus::Empty) {
+                return false;
+            }
+            if (status != queue::PopStatus::Ok) {
+                continue; // Busy
+            }
+            if (candidate.size == size) {
+                out = candidate;
+                return true;
+            }
+            SizeClass *const sizeClass =
+                (cache != nullptr and canCache(*cache, candidate)) ? findOrAddClass(*cache, candidate.size) : nullptr;
+            if (sizeClass != nullptr) {
+                pushFront(*cache, *sizeClass, candidate);
+            } else {
+                upstream.deallocate(candidate);
+            }
+        }
+        return false;
     }
 
     void drainToUpstream(ThreadCache &cache) noexcept {
@@ -202,6 +273,7 @@ private:
     bool keyValid = false;
     std::mutex registryMutex;
     std::vector<ThreadCache *> registry;
+    SharedPool shared;
 };
 
 } // namespace

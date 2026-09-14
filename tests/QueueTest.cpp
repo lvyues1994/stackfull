@@ -25,7 +25,7 @@ struct OwnerQueueTest : ::testing::Test {
 };
 
 using OwnerQueues = ::testing::Types<BwosQueue<int, 4, 4>, RingQueue<int, 16>, BwosQueue<int, 8, 32>>;
-TYPED_TEST_SUITE(OwnerQueueTest, OwnerQueues);
+TYPED_TEST_SUITE(OwnerQueueTest, OwnerQueues, );
 
 TYPED_TEST(OwnerQueueTest, StartsEmpty) {
     int value = 0;

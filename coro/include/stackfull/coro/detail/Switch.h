@@ -26,7 +26,7 @@ namespace stackfull {
 namespace coro {
 namespace detail {
 
-inline void swapEhGlobals(ContextBlock &prev, ContextBlock &self) noexcept {
+STACKFULL_ALWAYS_INLINE void swapEhGlobals(ContextBlock &prev, ContextBlock &self) noexcept {
 #if STACKFULL_SWAP_EH_GLOBALS
     EhGlobals &live = currentEhGlobals();
     prev.ehGlobals = live; // what the departing context left in this thread
@@ -39,7 +39,7 @@ inline void swapEhGlobals(ContextBlock &prev, ContextBlock &self) noexcept {
 
 // Bookkeeping shared by every way of arriving in a context: after a jump
 // returns, inside an ontop function, and at first entry.
-inline ThreadState &onArrival(ContextBlock &self, fcontext::transfer_t const transfer) noexcept {
+STACKFULL_ALWAYS_INLINE ThreadState &onArrival(ContextBlock &self, fcontext::transfer_t const transfer) noexcept {
     ContextBlock &prev = *static_cast<ContextBlock *>(transfer.data);
     prev.fctx = transfer.fctx;
     ThreadState &thread = *prev.thread;
@@ -54,7 +54,7 @@ inline ThreadState &onArrival(ContextBlock &self, fcontext::transfer_t const tra
     return thread;
 }
 
-inline void prepareDeparture(ContextBlock &from, ContextBlock &to, CoroutineState const fromState) noexcept {
+STACKFULL_ALWAYS_INLINE void prepareDeparture(ContextBlock &from, ContextBlock &to, CoroutineState const fromState) noexcept {
     from.thread->current = &to;
     from.state = fromState;
     to.state = CoroutineState::Running;
@@ -63,7 +63,7 @@ inline void prepareDeparture(ContextBlock &from, ContextBlock &to, CoroutineStat
 // Suspend `from` — which must be the running context — and continue `to`.
 // Returns once `from` is resumed, possibly on another thread; the returned
 // ThreadState is the one `from` is running on *now*.
-inline ThreadState &switchTo(ContextBlock &from, ContextBlock &to) {
+STACKFULL_ALWAYS_INLINE ThreadState &switchTo(ContextBlock &from, ContextBlock &to) {
     prepareDeparture(from, to, CoroutineState::Suspended);
     asanStartSwitch(from, to, /*fromWillResume=*/true);
     fcontext::transfer_t const transfer = fcontext::jump(to.fctx, &from);
@@ -73,7 +73,7 @@ inline ThreadState &switchTo(ContextBlock &from, ContextBlock &to) {
 // Like switchTo, but `fn` runs on `to`'s stack before `to` continues. `fn`
 // receives the same transfer `to` would have and must call onArrival itself,
 // because the code after `to`'s own jump does not run when `fn` throws.
-inline ThreadState &switchToOnTop(ContextBlock &from, ContextBlock &to, fcontext::ontop_fn const fn) {
+STACKFULL_ALWAYS_INLINE ThreadState &switchToOnTop(ContextBlock &from, ContextBlock &to, fcontext::ontop_fn const fn) {
     prepareDeparture(from, to, CoroutineState::Suspended);
     asanStartSwitch(from, to, /*fromWillResume=*/true);
     fcontext::transfer_t const transfer = fcontext::ontop(to.fctx, &from, fn);

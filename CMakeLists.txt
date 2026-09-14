@@ -46,10 +46,11 @@ include(cmake/StackfullOptions.cmake)
 # ---------------------------------------------------------------------------
 # Modules — one directory, one target, mirroring the layer diagram
 # ---------------------------------------------------------------------------
+add_subdirectory(queue)      # lock-free queues (header-only), used by stack and sched
 add_subdirectory(fcontext)   # L0: vendored boost.fcontext assembly + C++ declarations
 add_subdirectory(stack)      # L1: StackAllocator interface, mmap + pooled implementations
 add_subdirectory(coro)       # L2: Context / Coroutine
-add_subdirectory(queue)      # L3a: lock-free run/injection queues (header-only)
+add_subdirectory(sched)      # L3: M:N scheduler
 
 if(STACKFULL_BUILD_TESTS)
     enable_testing()

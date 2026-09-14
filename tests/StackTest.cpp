@@ -120,7 +120,7 @@ TEST(PooledStackAllocator, DifferentSizesUseDifferentClasses) {
     pooled->deallocate(again.stack);
 }
 
-TEST(PooledStackAllocator, HonoursCacheLimits) {
+TEST(PooledStackAllocator, OverflowGoesToTheSharedTierNotUpstream) {
     CountingAllocator upstream;
     PooledStackOptions options;
     options.maxCachedStacksPerThread = 1;
@@ -128,9 +128,49 @@ TEST(PooledStackAllocator, HonoursCacheLimits) {
 
     StackAllocation const first = pooled->allocate(16 * 1024);
     StackAllocation const second = pooled->allocate(16 * 1024);
-    pooled->deallocate(first.stack);  // cached
-    pooled->deallocate(second.stack); // over the limit → upstream
-    EXPECT_EQ(upstream.deallocations.load(), 1);
+    pooled->deallocate(first.stack);  // thread cache
+    pooled->deallocate(second.stack); // over the per-thread limit → shared tier
+    EXPECT_EQ(upstream.deallocations.load(), 0);
+
+    // Both come back without touching upstream again.
+    StackAllocation const a = pooled->allocate(16 * 1024);
+    StackAllocation const b = pooled->allocate(16 * 1024);
+    ASSERT_TRUE(a);
+    ASSERT_TRUE(b);
+    EXPECT_EQ(upstream.allocations.load(), 2);
+    pooled->deallocate(a.stack);
+    pooled->deallocate(b.stack);
+}
+
+// The scheduler pattern: one thread allocates, another releases.
+TEST(PooledStackAllocator, ProducerConsumerThreadsRecycleThroughTheSharedTier) {
+    CountingAllocator upstream;
+    auto const pooled = makePooledStackAllocator(upstream);
+    constexpr int kRounds = 2000;
+    std::vector<StackView> handoff(kRounds);
+    std::atomic<int> produced{0};
+    std::atomic<int> consumed{0};
+
+    std::thread consumer([&] {
+        while (consumed.load() < kRounds) {
+            int const next = consumed.load();
+            if (produced.load(std::memory_order_acquire) > next) {
+                pooled->deallocate(handoff[static_cast<std::size_t>(next)]);
+                consumed.fetch_add(1);
+            }
+        }
+    });
+    for (int i = 0; i < kRounds; ++i) {
+        while (produced.load() - consumed.load() >= 32) {
+        }
+        StackAllocation const allocation = pooled->allocate(16 * 1024);
+        ASSERT_TRUE(allocation);
+        handoff[static_cast<std::size_t>(i)] = allocation.stack;
+        produced.fetch_add(1, std::memory_order_release);
+    }
+    consumer.join();
+    // Far fewer than one mmap per round: the shared tier recycled them.
+    EXPECT_LT(upstream.allocations.load(), kRounds / 4);
 }
 
 TEST(PooledStackAllocator, DestructionDrainsEveryThreadCache) {

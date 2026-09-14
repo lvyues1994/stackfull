@@ -151,6 +151,27 @@ struct BbqQueue {
         }
     }
 
+    // Cheap, racy emptiness probe from the consumer side: looks at the
+    // consumer's block and, if that is exhausted, whether the producer has
+    // entered the next one. May be stale by one operation in either
+    // direction; use it for scheduling heuristics, not for correctness.
+    bool isEmptyApprox() const noexcept {
+        Head const head{consumerHead.load(std::memory_order_acquire)};
+        Block const &block = blocks[head.index()];
+        Cursor const reserved{block.reserved.load(std::memory_order_acquire)};
+        Cursor const committed{block.committed.load(std::memory_order_acquire)};
+        if (reserved.index() < BlockSize) {
+            return reserved.index() == committed.index();
+        }
+        Block const &next = blocks[(head.index() + 1) & (NumBlocks - 1)];
+        Cursor const nextCommitted{next.committed.load(std::memory_order_acquire)};
+        if (nextCommitted.version() != head.version() + 1) {
+            return true; // producer has not entered the next block
+        }
+        Cursor const nextReserved{next.reserved.load(std::memory_order_acquire)};
+        return nextReserved.version() == nextCommitted.version() and nextReserved.index() == nextCommitted.index();
+    }
+
 private:
     // Head: version | block index. The index occupies exactly log2(NumBlocks)
     // bits so `head + 1` carries into the version when the ring wraps.

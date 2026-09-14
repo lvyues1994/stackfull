@@ -53,3 +53,8 @@
 // --- Compiler helpers -----------------------------------------------------
 #define STACKFULL_NOINLINE __attribute__((noinline))
 #define STACKFULL_NODISCARD __attribute__((warn_unused_result))
+// The switch path must be inlined into its caller: an out-of-line wrapper
+// adds one mispredicted `ret` per switch (the return stack buffer belongs to
+// the other stack after a switch). Compilers judge these functions too big
+// to inline on their own.
+#define STACKFULL_ALWAYS_INLINE inline __attribute__((always_inline))

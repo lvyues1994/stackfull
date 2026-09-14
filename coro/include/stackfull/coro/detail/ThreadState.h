@@ -15,6 +15,9 @@ struct ThreadState {
     detail::ContextBlock mainBlock{};
     // Context executing on this thread right now.
     detail::ContextBlock *current = nullptr;
+    // Owned by the scheduler layer: the worker this thread is running, if
+    // any. Opaque here so the coroutine layer stays independent of it.
+    void *worker = nullptr;
 };
 
 namespace detail {

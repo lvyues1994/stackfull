@@ -15,4 +15,4 @@ target_include_directories(stackfull_stack PUBLIC include)
 find_package(Threads REQUIRED)
 target_link_libraries(stackfull_stack
     PUBLIC stackfull::options
-    PRIVATE stackfull_warnings Threads::Threads)
+    PRIVATE stackfull_warnings stackfull::queue Threads::Threads)

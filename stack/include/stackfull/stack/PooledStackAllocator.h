@@ -10,20 +10,26 @@ namespace stack {
 
 struct PooledStackOptions {
     // Upper bounds for the per-thread free list. Once either is reached,
-    // further deallocations go straight back to the upstream allocator.
+    // further deallocations go to the shared tier, then to upstream.
     std::size_t maxCachedStacksPerThread = 64;
     std::size_t maxCachedBytesPerThread = std::size_t{32} << 20; // 32 MiB
 };
 
-// Decorator: keeps a LIFO free list of stacks *per thread*, bucketed by size,
-// in front of `upstream`. Reusing the most recently released stack keeps its
-// pages hot in cache and avoids the mmap/munmap pair on the create/destroy
-// path. Stacks are not bound to threads: a stack released on thread B after
-// being allocated on thread A simply lands in B's cache.
+// Decorator with two tiers in front of `upstream`:
+//
+//   1. a per-thread LIFO free list bucketed by size — the most recently
+//      released stack is reused first, its pages still warm;
+//   2. a lock-free shared pool that absorbs a thread's overflow and feeds
+//      threads whose own cache is empty.
+//
+// The second tier matters for schedulers: a task's stack is typically
+// allocated by the thread that spawned it and released by whichever worker
+// ran it, so without it every spawn on a producer thread would fall through
+// to mmap.
 //
 // `upstream` is borrowed and must outlive the returned allocator. The pooled
 // allocator itself must outlive every thread that used it; destroying it
-// drains all thread caches back to `upstream`.
+// drains all caches back to `upstream`.
 std::unique_ptr<StackAllocator> makePooledStackAllocator(StackAllocator &upstream,
                                                          PooledStackOptions const &options = PooledStackOptions{});
 
