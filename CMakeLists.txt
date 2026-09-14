@@ -49,6 +49,7 @@ include(cmake/StackfullOptions.cmake)
 add_subdirectory(fcontext)   # L0: vendored boost.fcontext assembly + C++ declarations
 add_subdirectory(stack)      # L1: StackAllocator interface, mmap + pooled implementations
 add_subdirectory(coro)       # L2: Context / Coroutine
+add_subdirectory(queue)      # L3a: lock-free run/injection queues (header-only)
 
 if(STACKFULL_BUILD_TESTS)
     enable_testing()

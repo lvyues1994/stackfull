@@ -1,6 +1,10 @@
 {
   "version": 3,
-  "cmakeMinimumRequired": { "major": 3, "minor": 21, "patch": 0 },
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 21,
+    "patch": 0
+  },
   "configurePresets": [
     {
       "name": "base",
@@ -17,31 +21,49 @@
       "name": "debug",
       "inherits": "base",
       "displayName": "Linux x86_64 Debug",
-      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
     },
     {
       "name": "release",
       "inherits": "base",
       "displayName": "Linux x86_64 Release",
-      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
     },
     {
       "name": "asan",
       "inherits": "debug",
       "displayName": "Linux x86_64 Debug + AddressSanitizer",
-      "cacheVariables": { "STACKFULL_SANITIZE": "address" }
+      "cacheVariables": {
+        "STACKFULL_SANITIZE": "address"
+      }
+    },
+    {
+      "name": "tsan",
+      "inherits": "release",
+      "displayName": "Linux x86_64 Release + ThreadSanitizer (queue tests only)",
+      "cacheVariables": {
+        "STACKFULL_SANITIZE": "thread"
+      }
     },
     {
       "name": "noexc",
       "inherits": "release",
       "displayName": "Linux x86_64 Release, -fno-exceptions",
-      "cacheVariables": { "STACKFULL_EXCEPTIONS": false }
+      "cacheVariables": {
+        "STACKFULL_EXCEPTIONS": false
+      }
     },
     {
       "name": "pthread-tls",
       "inherits": "release",
       "displayName": "Linux x86_64 Release, pthread_key TLS backend",
-      "cacheVariables": { "STACKFULL_TLS_BACKEND": "PTHREAD_KEY" }
+      "cacheVariables": {
+        "STACKFULL_TLS_BACKEND": "PTHREAD_KEY"
+      }
     },
     {
       "name": "clang-release",
@@ -77,7 +99,9 @@
       "name": "android-arm64-api24",
       "inherits": "android-arm64",
       "displayName": "Android arm64-v8a, API 24 (emulated TLS → pthread_key backend)",
-      "cacheVariables": { "ANDROID_PLATFORM": "android-24" }
+      "cacheVariables": {
+        "ANDROID_PLATFORM": "android-24"
+      }
     },
     {
       "name": "android-armv7",
@@ -95,34 +119,123 @@
       "inherits": "cross-base",
       "displayName": "QNX aarch64le (qcc; source qnxsdp-env.sh first)",
       "toolchainFile": "${sourceDir}/cmake/toolchains/qnx.cmake",
-      "cacheVariables": { "STACKFULL_QNX_ARCH": "aarch64le" }
+      "cacheVariables": {
+        "STACKFULL_QNX_ARCH": "aarch64le"
+      }
     },
     {
       "name": "qnx-x86_64",
       "inherits": "qnx-aarch64le",
       "displayName": "QNX x86_64 (qcc)",
-      "cacheVariables": { "STACKFULL_QNX_ARCH": "x86_64" }
+      "cacheVariables": {
+        "STACKFULL_QNX_ARCH": "x86_64"
+      }
     }
   ],
   "buildPresets": [
-    { "name": "debug", "configurePreset": "debug" },
-    { "name": "release", "configurePreset": "release" },
-    { "name": "asan", "configurePreset": "asan" },
-    { "name": "noexc", "configurePreset": "noexc" },
-    { "name": "pthread-tls", "configurePreset": "pthread-tls" },
-    { "name": "clang-release", "configurePreset": "clang-release" },
-    { "name": "android-arm64", "configurePreset": "android-arm64" },
-    { "name": "android-arm64-api24", "configurePreset": "android-arm64-api24" },
-    { "name": "android-armv7", "configurePreset": "android-armv7" },
-    { "name": "qnx-aarch64le", "configurePreset": "qnx-aarch64le" },
-    { "name": "qnx-x86_64", "configurePreset": "qnx-x86_64" }
+    {
+      "name": "debug",
+      "configurePreset": "debug"
+    },
+    {
+      "name": "release",
+      "configurePreset": "release"
+    },
+    {
+      "name": "asan",
+      "configurePreset": "asan"
+    },
+    {
+      "name": "tsan",
+      "configurePreset": "tsan"
+    },
+    {
+      "name": "noexc",
+      "configurePreset": "noexc"
+    },
+    {
+      "name": "pthread-tls",
+      "configurePreset": "pthread-tls"
+    },
+    {
+      "name": "clang-release",
+      "configurePreset": "clang-release"
+    },
+    {
+      "name": "android-arm64",
+      "configurePreset": "android-arm64"
+    },
+    {
+      "name": "android-arm64-api24",
+      "configurePreset": "android-arm64-api24"
+    },
+    {
+      "name": "android-armv7",
+      "configurePreset": "android-armv7"
+    },
+    {
+      "name": "qnx-aarch64le",
+      "configurePreset": "qnx-aarch64le"
+    },
+    {
+      "name": "qnx-x86_64",
+      "configurePreset": "qnx-x86_64"
+    }
   ],
   "testPresets": [
-    { "name": "debug", "configurePreset": "debug", "output": { "outputOnFailure": true } },
-    { "name": "release", "configurePreset": "release", "output": { "outputOnFailure": true } },
-    { "name": "asan", "configurePreset": "asan", "output": { "outputOnFailure": true } },
-    { "name": "noexc", "configurePreset": "noexc", "output": { "outputOnFailure": true } },
-    { "name": "pthread-tls", "configurePreset": "pthread-tls", "output": { "outputOnFailure": true } },
-    { "name": "clang-release", "configurePreset": "clang-release", "output": { "outputOnFailure": true } }
+    {
+      "name": "debug",
+      "configurePreset": "debug",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "release",
+      "configurePreset": "release",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "asan",
+      "configurePreset": "asan",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "tsan",
+      "configurePreset": "tsan",
+      "output": {
+        "outputOnFailure": true
+      },
+      "filter": {
+        "include": {
+          "label": "queue"
+        }
+      }
+    },
+    {
+      "name": "noexc",
+      "configurePreset": "noexc",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "pthread-tls",
+      "configurePreset": "pthread-tls",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "clang-release",
+      "configurePreset": "clang-release",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
   ]
 }

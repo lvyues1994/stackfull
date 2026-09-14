@@ -11,15 +11,24 @@ endif()
 
 include(GoogleTest)
 
+# stackfull_add_test(<name> LABEL <label> LIBS <targets...> SOURCES <files...>)
+#
+# Labels let a preset run a subset: the `tsan` preset only runs `queue`,
+# because ThreadSanitizer needs fiber annotations the coroutine layer does
+# not carry yet.
 function(stackfull_add_test name)
-    add_executable(${name} ${ARGN})
-    target_link_libraries(${name} PRIVATE
-        stackfull::coro
-        GTest::gtest GTest::gtest_main
-        stackfull_warnings)
-    gtest_discover_tests(${name} DISCOVERY_MODE PRE_TEST)
+    cmake_parse_arguments(arg "" "LABEL" "LIBS;SOURCES" ${ARGN})
+    add_executable(${name} ${arg_SOURCES})
+    target_link_libraries(${name} PRIVATE ${arg_LIBS} GTest::gtest GTest::gtest_main stackfull_warnings)
+    if(STACKFULL_SANITIZE STREQUAL "thread" AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        # ThreadSanitizer's shadow layout rejects the 32-bit ASLR entropy of
+        # recent kernels ("unexpected memory mapping"); run tests without ASLR.
+        set_property(TARGET ${name} PROPERTY TEST_LAUNCHER setarch ${CMAKE_HOST_SYSTEM_PROCESSOR} -R)
+    endif()
+    gtest_discover_tests(${name} DISCOVERY_MODE PRE_TEST PROPERTIES LABELS ${arg_LABEL})
 endfunction()
 
-stackfull_add_test(stackfull_fcontext_test FcontextTest.cpp)
-stackfull_add_test(stackfull_stack_test StackTest.cpp)
-stackfull_add_test(stackfull_coro_test CoroutineTest.cpp)
+stackfull_add_test(stackfull_fcontext_test LABEL coro LIBS stackfull::coro SOURCES FcontextTest.cpp)
+stackfull_add_test(stackfull_stack_test    LABEL coro LIBS stackfull::coro SOURCES StackTest.cpp)
+stackfull_add_test(stackfull_coro_test     LABEL coro LIBS stackfull::coro SOURCES CoroutineTest.cpp)
+stackfull_add_test(stackfull_queue_test    LABEL queue LIBS stackfull::queue Threads::Threads SOURCES QueueTest.cpp)
