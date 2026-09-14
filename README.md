@@ -6,7 +6,10 @@
 
 ```
 ┌───────────────────────────────────────────────────────────┐
-│ L4  sync / io   Mutex · CondVar · Channel<T> · Poller        │  规划中
+│ L4b io          Poller 实现 Parker · 定时器 · fd 包装          │  规划中
+├───────────────────────────────────────────────────────────┤
+│ L4a sync        Semaphore · Mutex · CondVar · WaitGroup ·     │  ✔
+│                 Channel<T>（任务与普通线程都能用）              │
 ├───────────────────────────────────────────────────────────┤
 │ L3  sched       M:N 调度器：BWoS 本地队列 · BBQ 注入队列 ·     │  ✔
 │                 直接交接 · park/wake · pin · JoinHandle       │
@@ -20,7 +23,7 @@
 └───────────────────────────────────────────────────────────┘
 ```
 
-每层一个 CMake target：`stackfull::fcontext`、`stackfull::stack`、`stackfull::coro`、`stackfull::queue`（无锁队列，header-only）、`stackfull::sched`；`stackfull::stackfull` 是聚合目标。
+每层一个 CMake target：`stackfull::fcontext`、`stackfull::stack`、`stackfull::coro`、`stackfull::queue`（无锁队列，header-only）、`stackfull::sched`、`stackfull::sync`；`stackfull::stackfull` 是聚合目标。
 
 ## 使用
 
@@ -81,6 +84,42 @@ scheduler->stop();                         // 非阻塞：拒绝新 spawn，唤�
 - **放置策略**：pinned → 所属 worker 收件箱；有空闲 worker → 注入队列 + unpark 一个（BWoS 偷不到短队列，空闲者要喂而不是让它偷）；全忙 → 本地 LIFO 槽（连续 3 次后让队列）；外部线程 → 注入队列。空闲 worker 先自旋搜索再睡，生产者看到有搜索者就不发 futex。
 - **栈池共享层**：任务栈通常由 spawn 方线程分配、由运行它的 worker 释放，纯线程本地池会退化成每任务一次 mmap；池化分配器增加了一层无锁共享池（BBQ）。
 
+## 同步原语
+
+```cpp
+#include <stackfull/sync/Mutex.h>
+#include <stackfull/sync/ConditionVariable.h>
+#include <stackfull/sync/WaitGroup.h>
+#include <stackfull/sync/Channel.h>
+using namespace stackfull::sync;
+
+Mutex mutex;  ConditionVariable notEmpty;  std::deque<int> queue;
+WaitGroup done;  done.add(2);
+
+scheduler->spawn([&] {                          // 生产者
+    for (int i = 0; i < 100; ++i) {
+        LockGuard const guard(mutex);           // 可跨 yield/park 持有：等待的是任务而非线程
+        queue.push_back(i);
+        notEmpty.notifyOne();
+    }
+    done.done();
+});
+scheduler->spawn([&] {                          // 消费者
+    for (int i = 0; i < 100; ++i) {
+        LockGuard const guard(mutex);
+        notEmpty.wait(mutex, [&] { return not queue.empty(); });
+        queue.pop_front();
+    }
+    done.done();
+});
+done.wait();                                    // 主线程：阻塞在线程 Parker 上，同一个 WaitGroup
+```
+
+- 等待者是侵入式节点，放在等待方自己的栈上；原语内部只有一把保护链表的自旋锁，从不跨 park 持有。
+- 构造 `Waiter` 时绑定当前上下文：任务用 `WakeToken` park/wake，普通线程用线程本地 `Parker` 阻塞。`Mutex`、`Channel`、`WaitGroup` 因此在主线程和任务之间通用。
+- `Semaphore` 是核心（快路径允许插队，多余许可按 FIFO 移交等待者），`Mutex` 是二元信号量。`Channel<T>` 有界 MPMC，`close()` 唤醒所有阻塞方。
+- 语义与 std 一致：`ConditionVariable::wait` 可能虚假返回，按谓词循环；`Mutex` 非递归。
+
 ## 构建
 
 ```sh
@@ -119,6 +158,10 @@ gcc 13 -O3；Android 列为小米 25091RP04C（arm64，Android 16）上 NDK r28 
 | 跨 worker（pinned）park/wake 交接 | 60 ns | 99 ns |
 | spawn + 运行 + 释放，1 worker | 124 ns | 198 ns |
 | spawn + 运行 + 释放，4 workers（放置到空闲 worker） | 258 ns | 419 ns |
+| `Mutex` lock+unlock，无争用 | 14 ns | 29 ns |
+| `Mutex` lock+unlock，8 任务 / 4 workers 争用 | 366 ns | 450 ns |
+| `Channel<long>` 容量 64，1P/1C，2 workers | 15 ns | 51 ns |
+| `Channel<long>` 容量 1，1P/1C，2 workers | 90 ns | 268 ns |
 
 切换路径上的所有函数（`resume/yield`、`switchTo/onArrival`、`this_task::yield/park`）强制内联：栈切换后返回地址预测器失效，每多一层 `ret` 就多一次约 5 ns 的错误预测；GCC 自己不会内联这些"太大"的函数，实测 34 → 15.8 ns。
 
@@ -130,6 +173,10 @@ gcc 13 -O3；Android 列为小米 25091RP04C（arm64，Android 16）上 NDK r28 
 - 任务内阻塞系统调用会卡住整个 worker；先用 `pinToCurrentWorker()` 把线程亲和性相关代码钉住，IO 集成留给 L4。
 - `WakeToken::wake()` 可从任意线程调用；`park()` 允许虚假返回，按条件循环。
 - `Scheduler` 析构前不要求所有任务已结束，但要求 `run()` 已返回或 `start()` 过的 worker 可被 join。
+
+同步原语：
+
+- 唤醒协议的 Dekker 配对必须"先宣告、后检查"：`Semaphore::acquireSlow` 若先看 `permits` 再加 `waiterCount`，与释放方的"先加许可再看 `waiterCount`"不构成 SB 对，大约每两次运行丢一次唤醒（已修复并有测试覆盖）。写新原语时保持这个顺序。
 
 协程层：
 

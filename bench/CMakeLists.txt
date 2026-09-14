@@ -7,3 +7,6 @@ target_link_libraries(stackfull_queue_bench PRIVATE stackfull::queue Threads::Th
 
 add_executable(stackfull_sched_bench SchedBench.cpp)
 target_link_libraries(stackfull_sched_bench PRIVATE stackfull::sched stackfull_warnings)
+
+add_executable(stackfull_sync_bench SyncBench.cpp)
+target_link_libraries(stackfull_sync_bench PRIVATE stackfull::sync stackfull_warnings)
