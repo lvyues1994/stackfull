@@ -51,6 +51,7 @@ add_subdirectory(fcontext)   # L0: vendored boost.fcontext assembly + C++ declar
 add_subdirectory(stack)      # L1: StackAllocator interface, mmap + pooled implementations
 add_subdirectory(coro)       # L2: Context / Coroutine
 add_subdirectory(sched)      # L3: M:N scheduler
+add_subdirectory(sync)       # L4: task-aware synchronization primitives
 
 if(STACKFULL_BUILD_TESTS)
     enable_testing()

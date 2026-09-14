@@ -34,3 +34,4 @@ stackfull_add_test(stackfull_stack_test    LABEL coro LIBS stackfull::coro SOURC
 stackfull_add_test(stackfull_coro_test     LABEL coro LIBS stackfull::coro SOURCES CoroutineTest.cpp)
 stackfull_add_test(stackfull_queue_test    LABEL queue LIBS stackfull::queue Threads::Threads SOURCES QueueTest.cpp)
 stackfull_add_test(stackfull_sched_test    LABEL sched LIBS stackfull::sched SOURCES SchedulerTest.cpp)
+stackfull_add_test(stackfull_sync_test     LABEL sync LIBS stackfull::sync SOURCES SyncTest.cpp)
