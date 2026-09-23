@@ -196,12 +196,16 @@ inline void onTaskYielded(coro::detail::ContextBlock &suspended, void *const arg
 inline void onTaskParked(coro::detail::ContextBlock &suspended, void *const arg) noexcept {
     Worker &worker = *static_cast<Worker *>(arg);
     Task &task = static_cast<Task &>(suspended);
-    std::uint8_t const previous = task.parkState.exchange(raw(TaskState::Parked), std::memory_order_acq_rel);
-    if (previous == raw(TaskState::Notified)) {
-        // A wake raced ahead of the switch; the task never really sleeps.
-        task.parkState.store(raw(TaskState::Running), std::memory_order_relaxed);
-        worker.core.schedule(task);
+    std::uint8_t state = raw(TaskState::Running);
+    if (task.parkState.compare_exchange_strong(state, raw(TaskState::Parked), std::memory_order_acq_rel,
+                                               std::memory_order_acquire)) {
+        return;
     }
+    // A wake raced ahead of the switch (Notified): the task never sleeps.
+    // Parked must not show even for a moment, or a second waker would see it
+    // and schedule the task as well.
+    task.parkState.store(raw(TaskState::Running), std::memory_order_relaxed);
+    worker.core.schedule(task);
 }
 
 inline void onTaskFinished(coro::detail::ContextBlock &finished, void *const arg) noexcept {

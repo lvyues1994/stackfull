@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <string>
@@ -215,6 +216,50 @@ TEST(Scheduler, ParkWakePingPongAcrossWorkers) {
     scheduler->start();
     ASSERT_TRUE(waitIdle(*scheduler, std::chrono::seconds{30}));
     EXPECT_EQ(rounds.load(), 2 * kRounds);
+}
+
+// Several wakers keep waking tasks that keep parking. A task often parks
+// just as a wake arrives; the park hook must then reschedule it without
+// Parked ever becoming visible, or a second wake in that instant schedules
+// it again and it is resumed twice (a crash).
+TEST(Scheduler, ConcurrentWakesScheduleAParkingTaskOnce) {
+    auto scheduler = makeScheduler(withWorkers(16));
+    constexpr int kSleepers = 32;
+    constexpr int kWakers = 16;
+    std::vector<WakeToken> tokens(kSleepers);
+    std::atomic<int> registered{0};
+    std::atomic<bool> stop{false};
+    std::atomic<long> resumes{0};
+    for (int i = 0; i < kSleepers; ++i) {
+        ASSERT_TRUE(scheduler->spawn([&, i] {
+            tokens[static_cast<std::size_t>(i)] = this_task::token();
+            registered.fetch_add(1);
+            while (not stop.load(std::memory_order_relaxed)) {
+                this_task::park(); // woken spuriously as often as not
+                resumes.fetch_add(1, std::memory_order_relaxed);
+            }
+        }));
+    }
+    for (int w = 0; w < kWakers; ++w) {
+        ASSERT_TRUE(scheduler->spawn([&, w] {
+            while (registered.load() < kSleepers) {
+                this_task::yield();
+            }
+            for (int round = 0; not stop.load(std::memory_order_relaxed); ++round) {
+                tokens[static_cast<std::size_t>((w + round) % kSleepers)].wake();
+                if ((round & 63) == 0) {
+                    this_task::yield();
+                }
+            }
+        }));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds{300});
+    stop.store(true);
+    for (WakeToken const &token : tokens) {
+        token.wake(); // release sleepers parked after their last check
+    }
+    ASSERT_TRUE(waitIdle(*scheduler, std::chrono::seconds{30}));
+    EXPECT_GT(resumes.load(), 0);
 }
 
 TEST(Scheduler, TasksMigrateBetweenWorkers) {
