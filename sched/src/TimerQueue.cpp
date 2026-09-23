@@ -24,12 +24,13 @@ bool TimerQueue::add(TimerEntry &entry) noexcept {
     lock();
     entry.fired.store(false, std::memory_order_relaxed);
     entry.heapIndex = heap.size();
+    entry.queue = this;
     heap.push_back(&entry);
-    size.store(heap.size(), std::memory_order_relaxed);
     siftUp(entry.heapIndex);
-    bool const earliest = heap[0] == &entry;
+    bool const becameEarliest = heap[0] == &entry;
+    publishLocked();
     unlock();
-    return earliest;
+    return becameEarliest;
 }
 
 bool TimerQueue::cancel(TimerEntry &entry) noexcept {
@@ -44,12 +45,12 @@ bool TimerQueue::cancel(TimerEntry &entry) noexcept {
         swapAt(index, last);
     }
     heap.pop_back();
-    size.store(heap.size(), std::memory_order_relaxed);
     entry.heapIndex = TimerEntry::kNotQueued;
     if (index != last) {
         siftDown(index);
         siftUp(index);
     }
+    publishLocked();
     unlock();
     return true;
 }
@@ -68,11 +69,11 @@ std::size_t TimerQueue::fireExpired(TimePoint const now) noexcept {
             swapAt(0, last);
         }
         heap.pop_back();
-        size.store(heap.size(), std::memory_order_relaxed);
         entry.heapIndex = TimerEntry::kNotQueued;
         if (last != 0) {
             siftDown(0);
         }
+        publishLocked();
         // Copy the token and mark fired *inside* the lock; wake outside it.
         // The sleeper may return (and free the entry) as soon as it sees
         // `fired`, so the entry is not touched after this point.
@@ -84,14 +85,21 @@ std::size_t TimerQueue::fireExpired(TimePoint const now) noexcept {
     }
 }
 
-bool TimerQueue::nextDeadline(TimePoint &out) noexcept {
-    lock();
-    bool const any = not heap.empty();
-    if (any) {
-        out = heap[0]->deadline;
+// The active bit changes only on empty <-> non-empty and before `earliest`,
+// so a reader that loads the mask and then `earliest` never skips a queue
+// whose new deadline it would otherwise have seen.
+void TimerQueue::publishLocked() noexcept {
+    std::size_t const before = size.load(std::memory_order_relaxed);
+    std::size_t const now = heap.size();
+    if (activeMask != nullptr) {
+        if (before == 0 and now != 0) {
+            activeMask->fetch_or(activeBit, std::memory_order_seq_cst);
+        } else if (before != 0 and now == 0) {
+            activeMask->fetch_and(~activeBit, std::memory_order_seq_cst);
+        }
     }
-    unlock();
-    return any;
+    size.store(now, std::memory_order_relaxed);
+    earliest.store(heap.empty() ? kNoDeadline : ticksOf(heap[0]->deadline), std::memory_order_seq_cst);
 }
 
 void TimerQueue::swapAt(std::size_t const a, std::size_t const b) noexcept {

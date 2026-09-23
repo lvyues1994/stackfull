@@ -92,6 +92,36 @@ TEST(Timer, ManySleepersAllWake) {
     EXPECT_LT(elapsedSince(start).count(), 200);
 }
 
+// Each worker keeps its own timer queue and tasks migrate between sleeps:
+// deadlines added on any worker must be seen by whoever keeps time, and a
+// wakeup on another worker must still cancel/fire in the right queue.
+TEST(Timer, RepeatedSleepsAcrossManyWorkersWakeOnTime) {
+    auto scheduler = startScheduler(16);
+    constexpr int kSleepers = 400;
+    constexpr int kRounds = 5;
+    WaitGroup done;
+    done.add(kSleepers);
+    std::atomic<long> worstLateMicros{0};
+    for (int i = 0; i < kSleepers; ++i) {
+        ASSERT_TRUE(scheduler->spawn([&, i] {
+            std::mt19937 rng(static_cast<unsigned>(i));
+            for (int round = 0; round < kRounds; ++round) {
+                auto const wanted = milliseconds{1 + static_cast<int>(rng() % 20)};
+                auto const start = Clock::now();
+                this_task::sleepFor(wanted);
+                auto const late = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - start - wanted);
+                long seen = worstLateMicros.load();
+                while (late.count() > seen and not worstLateMicros.compare_exchange_weak(seen, late.count())) {
+                }
+                EXPECT_GE(late.count(), 0);
+            }
+            done.done();
+        }));
+    }
+    done.wait();
+    EXPECT_LT(worstLateMicros.load(), 50000);
+}
+
 // A worker that never yields cannot fire timers itself; an idle peer must.
 TEST(Timer, FiresWhileAnotherWorkerIsBusy) {
     auto scheduler = startScheduler(2);

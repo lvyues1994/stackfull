@@ -195,35 +195,66 @@ void SchedulerCore::unparkWorker(Worker &worker) noexcept {
     worker.parker->unpark();
 }
 
+// Against a worker that claims the timekeeper role, marks keeperDeadline as
+// scanning, reads every queue's earliest deadline and publishes its own: our
+// queue's mirror store precedes our loads, its mark precedes its reads, all
+// seq_cst. So either its scan sees our entry, or we see the mark (or the
+// deadline it computed without us) and wake it.
 void SchedulerCore::addTimer(TimerEntry &entry) noexcept {
-    bool const earliest = timers.add(entry);
-    // The timer lock orders this load against a worker reading the heap
-    // after claiming the role: either we see it here or it sees the entry.
+    Worker *const me = currentWorker();
+    STACKFULL_CHECK(me != nullptr, "stackfull: timers are added from tasks only");
+    me->timers.add(entry);
     if (Worker *const keeper = timekeeper.load(std::memory_order_seq_cst)) {
-        if (earliest) {
-            unparkWorker(*keeper); // it sleeps with the old, later timeout
+        if (ticksOf(entry.deadline) < keeperDeadline.load(std::memory_order_seq_cst)) {
+            unparkWorker(*keeper); // it would sleep past our deadline
         }
         return;
     }
     // Nobody sleeps on the timers. The calling worker claims the role once
     // it runs out of work; if it already has more lined up, a peer must.
-    Worker *const me = currentWorker();
-    if (me == nullptr or me->hasLocalWork()) {
+    if (me->hasLocalWork()) {
         ensureTimekeeper();
     }
 }
 
 void SchedulerCore::ensureTimekeeper() noexcept {
-    if (timekeeper.load(std::memory_order_seq_cst) == nullptr and hasIdleWorkers() and not timers.isEmptyApprox()) {
+    if (timekeeper.load(std::memory_order_seq_cst) == nullptr and hasIdleWorkers() and hasPendingTimers()) {
         notifyIdleWorker(); // a worker already searching claims the role when it sleeps
     }
 }
 
-void SchedulerCore::fireTimers() noexcept {
-    if (timers.isEmptyApprox()) {
-        return; // every busy worker calls this periodically: no shared lock when there is nothing to fire
+bool SchedulerCore::hasPendingTimers() const noexcept {
+    return timerMask.load(std::memory_order_relaxed) != 0;
+}
+
+bool SchedulerCore::nextDeadline(TimePoint &out) const noexcept {
+    std::int64_t earliest = kNoDeadline;
+    for (std::uint64_t mask = timerMask.load(std::memory_order_seq_cst); mask != 0; mask &= mask - 1) {
+        auto const index = static_cast<std::size_t>(__builtin_ctzll(mask));
+        std::int64_t const mine = workers[index]->timers.earliestTicks();
+        earliest = mine < earliest ? mine : earliest;
     }
-    timers.fireExpired(std::chrono::steady_clock::now());
+    if (earliest == kNoDeadline) {
+        return false;
+    }
+    out = TimePoint(TimePoint::duration(earliest));
+    return true;
+}
+
+// Every busy worker calls this periodically: only non-empty queues are
+// looked at, and those with nothing due are skipped without the lock.
+void SchedulerCore::fireTimers() noexcept {
+    std::uint64_t mask = timerMask.load(std::memory_order_acquire);
+    if (mask == 0) {
+        return;
+    }
+    TimePoint const now = std::chrono::steady_clock::now();
+    for (; mask != 0; mask &= mask - 1) {
+        TimerQueue &queue = workers[static_cast<std::size_t>(__builtin_ctzll(mask))]->timers;
+        if (queue.earliestTicks() <= ticksOf(now)) {
+            queue.fireExpired(now);
+        }
+    }
 }
 
 void SchedulerCore::markIdle(Worker &worker) noexcept {

@@ -67,7 +67,9 @@ void Worker::operator delete(void *const memory) noexcept {
 
 Worker::Worker(SchedulerCore &core_, std::size_t const index_)
     : core(core_), index(index_), rng(static_cast<std::uint32_t>(0x9E3779B9u * (index_ + 1))),
-      parker(makeParker()) {}
+      parker(makeParker()) {
+    timers.attachActiveMask(core.timerMask, std::uint64_t{1} << index_);
+}
 
 void Worker::run() {
     thread = &coro::detail::currentThreadState();
@@ -350,12 +352,16 @@ void Worker::sleepIdle() noexcept {
     }
 
     std::chrono::nanoseconds timeout{-1};
+    // While we look, any task adding a timer wakes us (see addTimer).
+    core.keeperDeadline.store(SchedulerCore::kScanningTimers, std::memory_order_seq_cst);
     TimePoint deadline;
-    if (core.timers.nextDeadline(deadline)) {
+    bool const anyTimer = core.nextDeadline(deadline);
+    if (anyTimer) {
         auto const now = std::chrono::steady_clock::now();
         timeout = deadline > now ? std::chrono::duration_cast<std::chrono::nanoseconds>(deadline - now)
                                  : std::chrono::nanoseconds{0};
     }
+    core.keeperDeadline.store(anyTimer ? ticksOf(deadline) : kNoDeadline, std::memory_order_seq_cst);
     if (stopping and (timeout < std::chrono::nanoseconds{0} or timeout > std::chrono::milliseconds{1})) {
         timeout = std::chrono::milliseconds{1};
     }

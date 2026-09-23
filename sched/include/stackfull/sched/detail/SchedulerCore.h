@@ -13,6 +13,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <vector>
 
@@ -102,10 +103,14 @@ struct SchedulerCore {
     void unparkWorker(Worker &worker) noexcept;
     // unparkWorker() for new work, flagging whether a peer worker sent it.
     void handOffTo(Worker &worker) noexcept;
-    // Queue a deadline; shortens the timekeeper's sleep if it became earliest.
+    // Queue a deadline on the calling worker (tasks only); wakes the
+    // timekeeper if it sleeps past it.
     void addTimer(TimerEntry &entry) noexcept;
-    // Fire what is due; any worker may call this.
+    // Fire what is due on every worker's queue; any worker may call this.
     void fireTimers() noexcept;
+    // Earliest deadline across all workers' queues, without locking.
+    bool nextDeadline(TimePoint &out) const noexcept;
+    bool hasPendingTimers() const noexcept;
     // Pending timers with nobody holding the timekeeper role: wake an idle
     // peer, which claims the role on its way back to sleep. Called by a
     // worker about to run tasks, which may keep it away from its own idle
@@ -133,8 +138,13 @@ struct SchedulerCore {
     std::atomic<bool> stopping{false};
 
     Driver *driver = nullptr;
-    TimerQueue timers;
     std::atomic<Worker *> timekeeper{nullptr};
+    // Bit per worker whose timer queue is non-empty.
+    std::atomic<std::uint64_t> timerMask{0};
+    // When the timekeeper will wake at the latest (kNoDeadline: only when
+    // woken), or kScanningTimers while it looks for the earliest deadline.
+    std::atomic<std::int64_t> keeperDeadline{kNoDeadline};
+    static constexpr std::int64_t kScanningTimers = std::numeric_limits<std::int64_t>::min();
 };
 
 } // namespace detail

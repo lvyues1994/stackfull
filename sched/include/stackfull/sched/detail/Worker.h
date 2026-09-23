@@ -116,6 +116,9 @@ struct Worker {
     // SchedulerCore::liveTasks().
     std::atomic<std::uint64_t> tasksCreated{0};
     std::atomic<std::uint64_t> tasksFinished{0};
+
+    // Deadlines added by tasks while running here; fired by any worker.
+    alignas(64) TimerQueue timers;
 };
 
 // Post-switch hooks (Runtime.h). Each runs on the arriving side once the

@@ -68,13 +68,11 @@ bool Waiter::blockUntil(std::chrono::steady_clock::time_point const deadline) {
     sched::detail::TimerEntry timer;
     timer.deadline = deadline;
     timer.token = token;
-    sched::detail::TimerQueue &queue = current.worker.core.timers;
     current.worker.core.addTimer(timer);
     struct CancelTimer {
-        sched::detail::TimerQueue &queue;
         sched::detail::TimerEntry &timer;
-        ~CancelTimer() { queue.cancel(timer); }
-    } cancelTimer{queue, timer};
+        ~CancelTimer() { sched::detail::cancelTimer(timer); }
+    } cancelTimer{timer};
     sched::this_task::park();
     return not timer.fired.load(std::memory_order_acquire);
 }

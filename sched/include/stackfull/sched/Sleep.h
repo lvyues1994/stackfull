@@ -23,15 +23,14 @@ inline void sleepUntil(std::chrono::steady_clock::time_point const deadline) {
     // must leave the queue first. cancel() returning false means it already
     // fired, and fireExpired() never touches an entry after marking it.
     struct CancelOnUnwind {
-        detail::TimerQueue &queue;
         detail::TimerEntry &entry;
         bool armed = true;
         ~CancelOnUnwind() {
             if (armed) {
-                queue.cancel(entry);
+                detail::cancelTimer(entry);
             }
         }
-    } cancelOnUnwind{current.worker.core.timers, entry};
+    } cancelOnUnwind{entry};
     while (not entry.fired.load(std::memory_order_acquire)) {
         park(); // spurious wakeups just loop
     }
