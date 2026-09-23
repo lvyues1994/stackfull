@@ -64,7 +64,7 @@ struct SchedulerImpl final : Scheduler {
     }
 
     std::size_t workerCount() const noexcept override { return core_.workers.size(); }
-    std::size_t liveTasks() const noexcept override { return core_.liveTasks.load(std::memory_order_acquire); }
+    std::size_t liveTasks() const noexcept override { return core_.liveTasks(); }
 
 protected:
     detail::SchedulerCore &core() noexcept override { return core_; }

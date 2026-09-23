@@ -78,6 +78,16 @@ struct SchedulerCore {
     Task *popInjection() noexcept;
     // Called on the arriving side after a finished task switched away.
     void releaseTask(Task &task) noexcept;
+    // Wake-token slots. `me` is the calling thread's worker, or nullptr on a
+    // foreign thread. acquireSlot() fails only when every slot is in use.
+    bool acquireSlot(Worker *me, std::uint32_t &slot) noexcept;
+    bool tryAcquireSlot(Worker *me, std::uint32_t &slot) noexcept;
+    void releaseSlot(Worker *me, std::uint32_t slot) noexcept;
+    // Live-task accounting, sharded per worker (inline, Runtime.h).
+    void countCreated(Worker *me) noexcept;
+    void countFinished(Worker *me) noexcept;
+    // Never below the true count; exact while no task starts or ends.
+    std::size_t liveTasks() const noexcept;
     // Wake every parked task once (cooperative shutdown), from any thread.
     void wakeAllParked() noexcept;
 
@@ -116,7 +126,9 @@ struct SchedulerCore {
 
     std::atomic<std::uint64_t> idleMask{0};
     std::atomic<std::uint32_t> searching{0};
-    std::atomic<std::uint32_t> liveTasks{0};
+    // Tasks created / finished on threads that are not workers.
+    std::atomic<std::uint64_t> foreignCreated{0};
+    std::atomic<std::uint64_t> foreignFinished{0};
     std::atomic<std::uint32_t> workersRunning{0};
     std::atomic<bool> stopping{false};
 

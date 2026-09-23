@@ -6,6 +6,7 @@
 #include <stackfull/coro/detail/StackLayout.h>
 #include <stackfull/fcontext/Fcontext.h>
 #include <stackfull/sched/SchedulerOptions.h>
+#include <stackfull/sched/detail/Runtime.h>
 #include <stackfull/sched/detail/SchedulerCore.h>
 #include <stackfull/sched/detail/Task.h>
 #include <stackfull/sched/detail/Worker.h>
@@ -29,39 +30,13 @@ struct TaskCreation {
     std::error_code error;
 };
 
-// Returns a slab index; false when maxTasks are alive.
-inline bool acquireSlot(SchedulerCore &core, std::uint32_t &slot) noexcept {
-    for (unsigned spins = 0;; ++spins) {
-        queue::PopStatus const status = core.freeSlots.pop(slot);
-        if (status == queue::PopStatus::Ok) {
-            return true;
-        }
-        if (status == queue::PopStatus::Empty) {
-            return false;
-        }
-        if (spins > 64) {
-            std::this_thread::yield();
-        }
-    }
-}
-
-inline void releaseSlot(SchedulerCore &core, std::uint32_t const slot) noexcept {
-    for (unsigned spins = 0;; ++spins) {
-        if (core.freeSlots.push(slot) == queue::PushStatus::Ok) {
-            return;
-        }
-        if (spins > 64) {
-            std::this_thread::yield();
-        }
-    }
-}
-
 struct SlotReleaseGuard {
     SchedulerCore *core;
+    Worker *me;
     std::uint32_t slot;
     ~SlotReleaseGuard() {
         if (core != nullptr) {
-            releaseSlot(*core, slot);
+            core->releaseSlot(me, slot);
         }
     }
     void release() noexcept { core = nullptr; }
@@ -78,11 +53,12 @@ TaskCreation createTask(SchedulerCore &core, F &&body, TaskOptions const &option
     if (core.stopping.load(std::memory_order_acquire)) {
         return TaskCreation{nullptr, std::make_error_code(std::errc::operation_canceled)};
     }
+    Worker *const me = core.currentWorker();
     std::uint32_t slot = 0;
-    if (not acquireSlot(core, slot)) {
+    if (not core.acquireSlot(me, slot)) {
         return TaskCreation{nullptr, std::make_error_code(std::errc::resource_unavailable_try_again)};
     }
-    SlotReleaseGuard slotGuard{&core, slot};
+    SlotReleaseGuard slotGuard{&core, me, slot};
 
     std::size_t const stackSize = options.stackSize != 0 ? options.stackSize : core.options.taskStackSize;
     stack::StackAllocation const allocation = core.allocator->allocate(stackSize);
@@ -114,7 +90,7 @@ TaskCreation createTask(SchedulerCore &core, F &&body, TaskOptions const &option
     task->fctx = fcontext::make(layout.stackTop, layout.usableSize, &taskEntry);
 
     core.slots[slot].task.store(task, std::memory_order_release);
-    core.liveTasks.fetch_add(1, std::memory_order_acq_rel);
+    core.countCreated(me); // before the task can run, so its finish is never counted first
     stackGuard.release();
     slotGuard.release();
     return TaskCreation{task, std::error_code{}};

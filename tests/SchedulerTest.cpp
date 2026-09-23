@@ -401,6 +401,41 @@ TEST(Scheduler, DroppingAJoinHandleDetaches) {
 // Limits and lifecycle
 // ---------------------------------------------------------------------------
 
+// Workers keep free slots in local caches; spawn() must still succeed until
+// every one of maxTasks slots is in use, wherever the free ones sit.
+TEST(Scheduler, SpawnLimitIsExactWhileWorkersCacheSlots) {
+    SchedulerOptions options = withWorkers(4);
+    options.maxTasks = 100;
+    auto scheduler = makeScheduler(options);
+    constexpr int kSpawners = 4;
+    std::atomic<int> children{0};
+    std::atomic<int> spawnersDone{0};
+    std::atomic<bool> release{false};
+    for (int s = 0; s < kSpawners; ++s) {
+        ASSERT_TRUE(scheduler->spawn([&] {
+            while (scheduler->spawn([&] {
+                while (not release.load()) {
+                    this_task::park();
+                }
+            })) {
+                children.fetch_add(1);
+                this_task::yield(); // let the other spawners interleave
+            }
+            spawnersDone.fetch_add(1);
+            while (not release.load()) {
+                this_task::yield();
+            }
+        }));
+    }
+    while (spawnersDone.load() < kSpawners) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+    EXPECT_EQ(children.load(), 100 - kSpawners);
+    release.store(true);
+    scheduler->stop(); // wakes the parked children once; they see `release`
+    ASSERT_TRUE(waitIdle(*scheduler));
+}
+
 TEST(Scheduler, SpawnFailsBeyondMaxTasks) {
     SchedulerOptions options = deferredSingleWorker(); // tasks stay alive until start()
     options.maxTasks = 4;

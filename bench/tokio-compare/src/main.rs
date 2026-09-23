@@ -48,14 +48,15 @@ fn scale_yield(n: usize) {
 fn scale_spawn(n: usize) {
     let rt = rt(n);
     let stop = leak(AtomicBool::new(false));
-    let done: Vec<&'static AtomicI64> = (0..n).map(|_| leak(AtomicI64::new(0))).collect();
+    // Four roots per worker, at most 16 children outstanding each (as in ScaleBench).
+    let done: Vec<&'static AtomicI64> = (0..4 * n).map(|_| leak(AtomicI64::new(0))).collect();
     let hs: Vec<_> = done
         .iter()
         .map(|&d| {
             rt.spawn(async move {
                 let mut issued = 0i64;
                 while !stop.load(Relaxed) {
-                    while issued - d.load(Relaxed) >= 64 {
+                    while issued - d.load(Relaxed) >= 16 {
                         tokio::task::yield_now().await;
                     }
                     tokio::spawn(async move {

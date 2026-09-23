@@ -91,17 +91,19 @@ void scaleYield(std::size_t const workers) {
                 rate / 1e6 / static_cast<double>(workers));
 }
 
-// One root task per worker spawns empty children, at most 64 outstanding each.
+// Four root tasks per worker spawn empty children, at most 16 outstanding
+// each. Several roots per worker keep every worker busy: an idle one would
+// have the others feed it through the injection queue instead.
 void scaleSpawn(std::size_t const workers) {
     auto scheduler = schedulerWith(workers);
     std::atomic<bool> stop{false};
-    std::vector<Counter> done(workers);
+    std::vector<Counter> done(4 * workers);
     for (Counter &rootDone : done) {
         Counter *const finished = &rootDone;
         scheduler->spawn([&scheduler, &stop, finished] {
             long issued = 0;
             while (not stop.load(std::memory_order_relaxed)) {
-                while (issued - finished->value.load(std::memory_order_relaxed) >= 64) {
+                while (issued - finished->value.load(std::memory_order_relaxed) >= 16) {
                     this_task::yield();
                 }
                 if (scheduler->spawn([finished] { finished->value.fetch_add(1, std::memory_order_relaxed); })) {

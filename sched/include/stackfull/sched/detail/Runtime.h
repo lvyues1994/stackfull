@@ -113,6 +113,22 @@ inline bool SchedulerCore::hasInjectedWork() const noexcept {
     return not injection.isEmptyApprox();
 }
 
+inline void SchedulerCore::countCreated(Worker *const me) noexcept {
+    if (me != nullptr) {
+        me->tasksCreated.store(me->tasksCreated.load(std::memory_order_relaxed) + 1, std::memory_order_release);
+    } else {
+        foreignCreated.fetch_add(1, std::memory_order_acq_rel);
+    }
+}
+
+inline void SchedulerCore::countFinished(Worker *const me) noexcept {
+    if (me != nullptr) {
+        me->tasksFinished.store(me->tasksFinished.load(std::memory_order_relaxed) + 1, std::memory_order_release);
+    } else {
+        foreignFinished.fetch_add(1, std::memory_order_acq_rel);
+    }
+}
+
 inline void SchedulerCore::inject(Task &task) noexcept {
     pushInjection(task);
     notifyIdleWorker();

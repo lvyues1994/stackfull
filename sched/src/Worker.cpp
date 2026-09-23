@@ -91,7 +91,7 @@ void Worker::run() {
         if (task == nullptr) {
             if (core.stopping.load(std::memory_order_acquire)) {
                 reapParkedTasks();
-                if (core.liveTasks.load(std::memory_order_acquire) == 0) {
+                if (core.liveTasks() == 0) {
                     break;
                 }
             }

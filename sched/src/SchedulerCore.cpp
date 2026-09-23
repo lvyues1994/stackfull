@@ -44,6 +44,46 @@ ExceptionSink &abortingExceptionSink() noexcept {
 }
 #endif
 
+bool popFreeSlot(SlotQueue &freeSlots, std::uint32_t &slot) noexcept {
+    for (unsigned spins = 0;; ++spins) {
+        queue::PopStatus const status = freeSlots.pop(slot);
+        if (status == queue::PopStatus::Ok) {
+            return true;
+        }
+        if (status == queue::PopStatus::Empty) {
+            return false;
+        }
+        if (spins > 64) {
+            std::this_thread::yield();
+        }
+    }
+}
+
+void pushFreeSlot(SlotQueue &freeSlots, std::uint32_t const slot) noexcept {
+    for (unsigned spins = 0;; ++spins) {
+        if (freeSlots.push(slot) == queue::PushStatus::Ok) {
+            return;
+        }
+        if (spins > 64) {
+            std::this_thread::yield();
+        }
+    }
+}
+
+struct SlotCacheGuard {
+    explicit SlotCacheGuard(Worker::SlotCache &cache_) noexcept : cache(cache_) {
+        while (cache.locked.exchange(true, std::memory_order_acquire)) {
+            while (cache.locked.load(std::memory_order_relaxed)) {
+                std::this_thread::yield();
+            }
+        }
+    }
+    ~SlotCacheGuard() { cache.locked.store(false, std::memory_order_release); }
+    SlotCacheGuard(SlotCacheGuard const &) = delete;
+    SlotCacheGuard &operator=(SlotCacheGuard const &) = delete;
+    Worker::SlotCache &cache;
+};
+
 void finishJoin(JoinState &join) noexcept {
     // seq_cst on both sides makes this a Dekker pair with JoinHandle::join():
     // either we see the registered waiter or the joiner sees `done`.
@@ -71,7 +111,7 @@ SchedulerCore::SchedulerCore(SchedulerOptions const &options_) : options(options
 
     slots = std::make_unique<TaskSlot[]>(options.maxTasks);
     for (std::uint32_t i = 0; i < options.maxTasks; ++i) {
-        releaseSlot(*this, i);
+        pushFreeSlot(freeSlots, i);
     }
 
     workers.reserve(options.workers);
@@ -180,6 +220,9 @@ void SchedulerCore::ensureTimekeeper() noexcept {
 }
 
 void SchedulerCore::fireTimers() noexcept {
+    if (timers.isEmptyApprox()) {
+        return; // every busy worker calls this periodically: no shared lock when there is nothing to fire
+    }
     timers.fireExpired(std::chrono::steady_clock::now());
 }
 
@@ -240,13 +283,109 @@ void SchedulerCore::releaseTask(Task &task) noexcept {
     coro::detail::tsanDestroyFiber(task);
     task.~Task();
     stackAllocator->deallocate(stack);
-    releaseSlot(*this, slot);
+    Worker *const me = currentWorker();
+    // Counted as finished before its slot is free: when acquireSlot() finds
+    // no slot yet sees fewer than maxTasks live tasks, one is on its way.
+    countFinished(me);
+    releaseSlot(me, slot);
 
-    if (liveTasks.fetch_sub(1, std::memory_order_acq_rel) == 1 and stopping.load(std::memory_order_acquire)) {
-        for (auto const &worker : workers) {
-            unparkWorker(*worker); // let everyone observe "no tasks left" and exit
+    if (stopping.load(std::memory_order_acquire)) {
+        // Finishers that race here RMW the same word: the later one reads
+        // from the earlier and so sees its count, and the last to finish sees
+        // zero. (Workers would still notice within a timed park.)
+        stopping.exchange(true, std::memory_order_acq_rel);
+        if (liveTasks() == 0) {
+            for (auto const &worker : workers) {
+                unparkWorker(*worker); // let everyone observe "no tasks left" and exit
+            }
         }
     }
+}
+
+// The global free list is a shared MPMC queue; each worker keeps a small
+// LIFO of slots in front of it and trades them in batches. Recently freed
+// slots are reused first, keeping their TaskSlot entries in this core's cache.
+bool SchedulerCore::acquireSlot(Worker *const me, std::uint32_t &slot) noexcept {
+    for (;;) {
+        if (tryAcquireSlot(me, slot)) {
+            return true;
+        }
+        // Slots can be in transit between a cache and the global list; give
+        // up only when maxTasks tasks really are alive.
+        if (liveTasks() >= options.maxTasks) {
+            return false;
+        }
+        std::this_thread::yield();
+    }
+}
+
+bool SchedulerCore::tryAcquireSlot(Worker *const me, std::uint32_t &slot) noexcept {
+    if (me != nullptr) {
+        Worker::SlotCache &cache = me->slotCache;
+        SlotCacheGuard const guard(cache);
+        if (cache.count == 0) {
+            while (cache.count < Worker::SlotCache::kBatch and popFreeSlot(freeSlots, cache.slots[cache.count])) {
+                ++cache.count;
+            }
+        }
+        if (cache.count != 0) {
+            slot = cache.slots[--cache.count];
+            return true;
+        }
+    } else if (popFreeSlot(freeSlots, slot)) {
+        return true;
+    }
+    // The global list is dry: take a slot some worker is holding, so that
+    // spawn() fails only once all maxTasks are really in use.
+    for (auto const &worker : workers) {
+        if (worker.get() == me) {
+            continue;
+        }
+        Worker::SlotCache &cache = worker->slotCache;
+        SlotCacheGuard const guard(cache);
+        if (cache.count != 0) {
+            slot = cache.slots[--cache.count];
+            return true;
+        }
+    }
+    return popFreeSlot(freeSlots, slot); // one may have been handed back meanwhile
+}
+
+void SchedulerCore::releaseSlot(Worker *const me, std::uint32_t const slot) noexcept {
+    if (me == nullptr) {
+        pushFreeSlot(freeSlots, slot);
+        return;
+    }
+    Worker::SlotCache &cache = me->slotCache;
+    SlotCacheGuard const guard(cache);
+    if (cache.count == Worker::SlotCache::kCapacity) {
+        // Full: hand the oldest half back, keep the recently used ones.
+        constexpr std::uint32_t kBatch = Worker::SlotCache::kBatch;
+        for (std::uint32_t i = 0; i < kBatch; ++i) {
+            pushFreeSlot(freeSlots, cache.slots[i]);
+        }
+        for (std::uint32_t i = kBatch; i < cache.count; ++i) {
+            cache.slots[i - kBatch] = cache.slots[i];
+        }
+        cache.count -= kBatch;
+    }
+    cache.slots[cache.count++] = slot;
+}
+
+std::size_t SchedulerCore::liveTasks() const noexcept {
+    // Finished counts first, created counts second: a finish that is seen
+    // happened after its creation, which is then seen too. The difference
+    // can therefore only overcount (a task created during the scan), never
+    // report zero while a task lives.
+    std::uint64_t finished = foreignFinished.load(std::memory_order_acquire);
+    for (auto const &worker : workers) {
+        finished += worker->tasksFinished.load(std::memory_order_acquire);
+    }
+    std::uint64_t created = foreignCreated.load(std::memory_order_acquire);
+    for (auto const &worker : workers) {
+        created += worker->tasksCreated.load(std::memory_order_acquire);
+    }
+    return static_cast<std::size_t>(created - finished);
 }
 
 void SchedulerCore::wakeAllParked() noexcept {

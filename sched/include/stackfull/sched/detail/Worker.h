@@ -98,6 +98,24 @@ struct Worker {
     // worker-to-worker exchange, where spinning pays off even if it did not
     // while the exchange ran through futex wakes. Foreign threads leave it.
     std::atomic<bool> handoffWake{false};
+
+    // Free wake-token slots kept by this worker so that spawning and
+    // finishing tasks do not all contend on the global free list. The lock
+    // is uncontended except when the global list runs dry and another
+    // thread takes slots from here (see SchedulerCore::acquireSlot).
+    struct SlotCache {
+        static constexpr std::uint32_t kCapacity = 64;
+        static constexpr std::uint32_t kBatch = 32; // moved to/from the global list at once
+        std::atomic<bool> locked{false};
+        std::uint32_t count = 0;
+        std::uint32_t slots[kCapacity];
+    };
+    alignas(64) SlotCache slotCache;
+
+    // Tasks this worker created and finished. Single writer; summed by
+    // SchedulerCore::liveTasks().
+    std::atomic<std::uint64_t> tasksCreated{0};
+    std::atomic<std::uint64_t> tasksFinished{0};
 };
 
 // Post-switch hooks (Runtime.h). Each runs on the arriving side once the
