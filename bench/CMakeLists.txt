@@ -16,3 +16,6 @@ target_link_libraries(stackfull_io_bench PRIVATE stackfull::io stackfull::sync s
 
 add_executable(stackfull_cpu_bench CpuBench.cpp)
 target_link_libraries(stackfull_cpu_bench PRIVATE stackfull::sched stackfull::sync stackfull_warnings)
+
+add_executable(stackfull_scale_bench ScaleBench.cpp)
+target_link_libraries(stackfull_scale_bench PRIVATE stackfull::sched stackfull_warnings)

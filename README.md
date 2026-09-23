@@ -97,7 +97,7 @@ int main() {
 
 - **本地队列 BWoS**（OSDI'23，自 Tokio 参考实现移植，`queue/PROVENANCE.md`）：owner 快路径块内 relaxed 原子、零屏障；窃取按块。全局注入队列 **BBQ**（ATC'22）无锁 MPMC，容量绑定 `maxTasks` 故永不满；slab 空闲索引同样用 BBQ。`-DSTACKFULL_SCHED_QUEUE=RING` 切换到 Go 风格环形队列做对照。
 - **直接交接**：`yield/park/结束` 在任务栈上取下一个本地任务并一次切换过去；`PostSwitchHook` 在到达方执行重入队 / park 状态迁移 / 释放栈，保证任务寄存器保存完毕后才可能被别的线程恢复。
-- **park/wake 协议**：`Running → Parked → Notified → Running` 两侧各一次原子操作，无锁无自旋；wake 令牌粘滞，早到的 wake 让下一次 park 立即返回。`WakeToken` 是 `(slot, generation)`，释放时等待 pin 计数归零，过期令牌安全。
+- **park/wake 协议**：`Running → Parked → Notified → Running` 两侧各一次原子操作，无锁无自旋；wake 令牌粘滞，早到的 wake 让下一次 park 立即返回。park 一侧用 CAS `Running → Parked`，若已被唤醒（Notified）则直接回到 Running 并重排——Parked 哪怕短暂出现一瞬，第二个唤醒者也会再调度一次，任务被恢复两次（曾经的 bug，`ConcurrentWakesScheduleAParkingTaskOnce` 覆盖）。`WakeToken` 是 `(slot, generation)`，释放时等待 pin 计数归零，过期令牌安全。
 - **放置策略**：pinned → 所属 worker 收件箱；有空闲 worker → 注入队列 + unpark 一个（BWoS 偷不到短队列，空闲者要喂而不是让它偷）；全忙 → 本地 LIFO 槽（连续 3 次后让队列）；外部线程 → 注入队列。计时线程触发定时器或轮询 Driver 时把唤醒的任务收成一批：第一个自己跑，其余进注入队列只唤醒一个同伴；最后一个搜索者只在还有剩余工作时才继续唤醒下一个。孤立事件因此只唤醒一个线程。
 - **空闲自旋**：按时间限制（5 µs，而不是迭代次数——刚出深度空闲的核频率低，迭代预算会拖成几十微秒），同时最多 2 个 worker 自旋；连续落空后按 2、4…32 个空闲周期指数退避，被同伴 worker 交接唤醒时清零。生产者看到有搜索者就不发 futex。
 - **计时角色不悬空**：只要还有挂起的定时器和空闲 worker，就必须有人持有计时角色；worker 带着角色空缺去跑任务前会叫醒一个空闲同伴接手，唤醒空闲 worker 时也优先绕开正在守定时器的那个。
@@ -270,6 +270,23 @@ gcc 13 -O3；Android 列为小米 25091RP04C（arm64，Android 16）上 NDK r28 
 | TCP loopback echo 往返（1 字节，epoll，1 worker） | 4.0–4.6 µs | 未复测 |
 | TCP loopback echo 往返（poll 后端，2 workers） | 4.7–5.6 µs | 未复测 |
 | 100 任务并发 `sleepFor(200µs)`，每个定时器分摊 | 2.6 µs | 2.8 µs |
+
+### 多核扩展与 Tokio 对照
+
+`bench/ScaleBench.cpp`（`stackfull_scale_bench [scale|yield|spawn|pingpong|mem|lat]`）；`bench/tokio-compare` 是同样用例的 Tokio 版（`cargo run --release -- [scale|mem|lat|chan|cpu]`，Tokio 1.53）。i7-13700KF（8P+8E，24 线程），同机：
+
+| 用例 | stackfull | Tokio |
+|---|---|---|
+| `yield`，1 → 24 workers | 124 → 1638 M/s | 15 → 26 M/s |
+| park/wake 乒乓，1 → 24 workers | 24 → 135 M handoffs/s | 9 → 68 M handoffs/s |
+| 扇出 spawn，1 → 24 workers | 9.1 → 14.1 M/s | 7.7 → 9.7 M/s |
+| 跨 worker channel，容量 1 / 64 | 约 100 / 17 ns | 258 / 59 ns |
+| 外部线程唤醒任务，每 1 ms，p50 / p99 | 16 / 110 µs | 20 / 104–140 µs |
+| 外部线程唤醒任务，每 20 µs，p50 / p99 | 2.5 / 3.6 µs | 2.8 / 10.6 µs |
+| 每个 parked 任务 RSS | 约 4 KiB + 2 个映射 | 0.4 KiB |
+| 冷栈池 spawn | 2.5–5.5 µs | 0.26 µs |
+
+spawn 不随核数扩展（全局空闲槽位队列与 `liveTasks` 计数）；Tokio 的 `yield_now` 会把任务推迟到本轮之后，语义不同。
 
 ### 空闲与稀疏负载的 CPU 占用
 
