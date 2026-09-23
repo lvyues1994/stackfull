@@ -338,10 +338,14 @@ TEST(Channel, ManyProducersManyConsumersDeliverEverythingOnce) {
     }
 }
 
-TEST(Channel, CloseWakesBlockedSendersAndReceivers) {
+// Which receiver gets which item is up to scheduling: a woken receiver
+// retries and may lose to one that is still running. Only totals are
+// checked, and the task bodies never return early (group.wait() would hang).
+TEST(Channel, CloseWakesBlockedReceivers) {
     auto scheduler = startScheduler(2);
     Channel<int> channel(1);
     std::atomic<int> sendFailed{0};
+    std::atomic<int> received{0};
     std::atomic<int> recvFailed{0};
     WaitGroup group;
     group.add(3);
@@ -352,27 +356,44 @@ TEST(Channel, CloseWakesBlockedSendersAndReceivers) {
         }
         group.done();
     }));
+    for (int r = 0; r < 2; ++r) {
+        ASSERT_TRUE(scheduler->spawn([&] {
+            int value = 0;
+            while (channel.recv(value)) {
+                received.fetch_add(1);
+            }
+            recvFailed.fetch_add(1);
+            group.done();
+        }));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds{10});
+    channel.close();
+    group.wait();
+    EXPECT_EQ(recvFailed.load(), 2);
+    EXPECT_EQ(received.load() + sendFailed.load(), 2); // item 2 is lost only if close() beat the sender
+    EXPECT_FALSE(channel.send(3));
+    EXPECT_TRUE(channel.isClosed());
+}
+
+TEST(Channel, CloseFailsABlockedSenderAndKeepsTheBuffer) {
+    auto scheduler = startScheduler(2);
+    Channel<int> channel(1);
+    ASSERT_TRUE(channel.trySend(1)); // full, and nobody receives
+    std::atomic<bool> sendResult{true};
+    WaitGroup group;
+    group.add(1);
     ASSERT_TRUE(scheduler->spawn([&] {
-        int value = 0;
-        ASSERT_TRUE(channel.recv(value)); // drains the buffered 1 (or 2, if the sender got in first)
-        while (channel.recv(value)) {
-        }
-        recvFailed.fetch_add(1);
-        group.done();
-    }));
-    ASSERT_TRUE(scheduler->spawn([&] {
-        int value = 0;
-        while (channel.recv(value)) {
-        }
-        recvFailed.fetch_add(1);
+        sendResult.store(channel.send(2));
         group.done();
     }));
     std::this_thread::sleep_for(std::chrono::milliseconds{10});
     channel.close();
     group.wait();
-    EXPECT_EQ(recvFailed.load(), 2);
-    EXPECT_FALSE(channel.send(3));
-    EXPECT_TRUE(channel.isClosed());
+    EXPECT_FALSE(sendResult.load());
+    int value = 0;
+    EXPECT_TRUE(channel.recv(value)); // what was buffered before close() drains
+    EXPECT_EQ(value, 1);
+    EXPECT_FALSE(channel.recv(value));
 }
 
 TEST(Channel, MoveOnlyPayloadsAndDestructorDrainsLeftovers) {

@@ -98,7 +98,9 @@ int main() {
 - **本地队列 BWoS**（OSDI'23，自 Tokio 参考实现移植，`queue/PROVENANCE.md`）：owner 快路径块内 relaxed 原子、零屏障；窃取按块。全局注入队列 **BBQ**（ATC'22）无锁 MPMC，容量绑定 `maxTasks` 故永不满；slab 空闲索引同样用 BBQ。`-DSTACKFULL_SCHED_QUEUE=RING` 切换到 Go 风格环形队列做对照。
 - **直接交接**：`yield/park/结束` 在任务栈上取下一个本地任务并一次切换过去；`PostSwitchHook` 在到达方执行重入队 / park 状态迁移 / 释放栈，保证任务寄存器保存完毕后才可能被别的线程恢复。
 - **park/wake 协议**：`Running → Parked → Notified → Running` 两侧各一次原子操作，无锁无自旋；wake 令牌粘滞，早到的 wake 让下一次 park 立即返回。`WakeToken` 是 `(slot, generation)`，释放时等待 pin 计数归零，过期令牌安全。
-- **放置策略**：pinned → 所属 worker 收件箱；有空闲 worker → 注入队列 + unpark 一个（BWoS 偷不到短队列，空闲者要喂而不是让它偷）；全忙 → 本地 LIFO 槽（连续 3 次后让队列）；外部线程 → 注入队列。空闲 worker 先自旋搜索再睡，生产者看到有搜索者就不发 futex。
+- **放置策略**：pinned → 所属 worker 收件箱；有空闲 worker → 注入队列 + unpark 一个（BWoS 偷不到短队列，空闲者要喂而不是让它偷）；全忙 → 本地 LIFO 槽（连续 3 次后让队列）；外部线程 → 注入队列。计时线程触发定时器或轮询 Driver 时把唤醒的任务收成一批：第一个自己跑，其余进注入队列只唤醒一个同伴；最后一个搜索者只在还有剩余工作时才继续唤醒下一个。孤立事件因此只唤醒一个线程。
+- **空闲自旋**：按时间限制（5 µs，而不是迭代次数——刚出深度空闲的核频率低，迭代预算会拖成几十微秒），同时最多 2 个 worker 自旋；连续落空后按 2、4…32 个空闲周期指数退避，被同伴 worker 交接唤醒时清零。生产者看到有搜索者就不发 futex。
+- **计时角色不悬空**：只要还有挂起的定时器和空闲 worker，就必须有人持有计时角色；worker 带着角色空缺去跑任务前会叫醒一个空闲同伴接手，唤醒空闲 worker 时也优先绕开正在守定时器的那个。
 - **栈池共享层**：任务栈通常由 spawn 方线程分配、由运行它的 worker 释放，纯线程本地池会退化成每任务一次 mmap；池化分配器增加了一层无锁共享池（BBQ）。
 
 ## 同步原语
@@ -264,9 +266,22 @@ gcc 13 -O3；Android 列为小米 25091RP04C（arm64，Android 16）上 NDK r28 
 | `Mutex` lock+unlock，8 任务 / 4 workers 争用 | 366 ns | 450 ns |
 | `Channel<long>` 容量 64，1P/1C，2 workers | 15 ns | 51 ns |
 | `Channel<long>` 容量 1，1P/1C，2 workers | 90 ns | 268 ns |
-| TCP loopback echo 往返（1 字节，epoll，2 workers） | 8.1 µs | 30 µs |
-| TCP loopback echo 往返（poll 后端） | 8.9 µs | 38 µs |
+| TCP loopback echo 往返（1 字节，epoll，2 workers） | 4.0–5.4 µs | 未复测 |
+| TCP loopback echo 往返（1 字节，epoll，1 worker） | 4.0–4.6 µs | 未复测 |
+| TCP loopback echo 往返（poll 后端，2 workers） | 4.7–5.6 µs | 未复测 |
 | 100 任务并发 `sleepFor(200µs)`，每个定时器分摊 | 2.6 µs | 2.8 µs |
+
+### 空闲与稀疏负载的 CPU 占用
+
+`bench/CpuBench.cpp`（`stackfull_cpu_bench [每个用例秒数] [用例名子串]`）按线程读 `/proc/self/task/*/schedstat`，排除外部生产者线程，只算调度器自己；“裸线程”是同样事件落在一个 `std::thread` 上的下限。x86_64，24 核，默认 24 个 worker，百分比为占一个核：
+
+| 场景 | 调度器 | 裸线程 |
+|---|---|---|
+| 无任务 / 1 万个 parked 任务 | 0% | — |
+| 1 个任务循环 `sleepFor(1ms)` | 0.6%（每次 1 个线程唤醒） | 0.5–1.1% |
+| 100 任务 × `sleepFor(10ms)` | 7.9% | — |
+| 外部线程每 1 ms spawn 一个空任务 | 0.6–1.6% | 0.65–1.0% |
+| 外部线程每 10 µs spawn 一个空任务 | 16% | 12–14% |
 
 切换路径上的所有函数（`resume/yield`、`switchTo/onArrival`、`this_task::yield/park`）强制内联：栈切换后返回地址预测器失效，每多一层 `ret` 就多一次约 5 ns 的错误预测；GCC 自己不会内联这些"太大"的函数，实测 34 → 15.8 ns。
 

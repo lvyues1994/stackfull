@@ -25,6 +25,7 @@ bool TimerQueue::add(TimerEntry &entry) noexcept {
     entry.fired.store(false, std::memory_order_relaxed);
     entry.heapIndex = heap.size();
     heap.push_back(&entry);
+    size.store(heap.size(), std::memory_order_relaxed);
     siftUp(entry.heapIndex);
     bool const earliest = heap[0] == &entry;
     unlock();
@@ -43,6 +44,7 @@ bool TimerQueue::cancel(TimerEntry &entry) noexcept {
         swapAt(index, last);
     }
     heap.pop_back();
+    size.store(heap.size(), std::memory_order_relaxed);
     entry.heapIndex = TimerEntry::kNotQueued;
     if (index != last) {
         siftDown(index);
@@ -66,6 +68,7 @@ std::size_t TimerQueue::fireExpired(TimePoint const now) noexcept {
             swapAt(0, last);
         }
         heap.pop_back();
+        size.store(heap.size(), std::memory_order_relaxed);
         entry.heapIndex = TimerEntry::kNotQueued;
         if (last != 0) {
             siftDown(0);

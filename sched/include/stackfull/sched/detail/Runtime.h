@@ -84,6 +84,17 @@ inline bool Worker::hasLocalWork() const noexcept {
     return lifoSlot != nullptr or local.hasEntries() or not pinnedInbox.isEmpty();
 }
 
+inline void Worker::gather(Task &task) noexcept {
+    // mpscNext is free: gathered tasks are unpinned, so in no inbox.
+    task.mpscNext.store(nullptr, std::memory_order_relaxed);
+    if (gatheredTail != nullptr) {
+        gatheredTail->mpscNext.store(&task, std::memory_order_relaxed);
+    } else {
+        gatheredHead = &task;
+    }
+    gatheredTail = &task;
+}
+
 // ---------------------------------------------------------------------------
 // SchedulerCore
 // ---------------------------------------------------------------------------
@@ -98,7 +109,16 @@ inline bool SchedulerCore::hasIdleWorkers() const noexcept {
     return idleMask.load(std::memory_order_acquire) != 0;
 }
 
+inline bool SchedulerCore::hasInjectedWork() const noexcept {
+    return not injection.isEmptyApprox();
+}
+
 inline void SchedulerCore::inject(Task &task) noexcept {
+    pushInjection(task);
+    notifyIdleWorker();
+}
+
+inline void SchedulerCore::pushInjection(Task &task) noexcept {
     for (unsigned spins = 0;; ++spins) {
         queue::PushStatus const status = injection.push(&task);
         if (status == queue::PushStatus::Ok) {
@@ -110,14 +130,14 @@ inline void SchedulerCore::inject(Task &task) noexcept {
             std::this_thread::yield(); // another thread is between allocate and commit
         }
     }
-    notifyIdleWorker();
 }
 
 // Placement policy. Pinned tasks go to their worker. Otherwise: a worker
-// with idle peers hands the task to one of them through the injection queue
-// (BWoS cannot steal from a short queue, so idle workers must be fed, not
-// left to steal); a fully busy worker keeps it local in the LIFO slot; a
-// foreign thread always injects.
+// firing timers or polling the driver gathers the tasks it wakes and places
+// them as one batch; a worker with idle peers hands the task to one of them
+// through the injection queue (BWoS cannot steal from a short queue, so idle
+// workers must be fed, not left to steal); a fully busy worker keeps it
+// local in the LIFO slot; a foreign thread always injects.
 inline void SchedulerCore::schedule(Task &task) noexcept {
     if (task.pinnedTo != nullptr) {
         Worker &target = *task.pinnedTo;
@@ -125,10 +145,15 @@ inline void SchedulerCore::schedule(Task &task) noexcept {
         notifyWorker(target); // RMW on idleMask: orders the push against the worker's idle re-check
         return;
     }
-    Worker *const me = currentWorker();
-    if (me != nullptr and not hasIdleWorkers()) {
-        me->pushLocalLifo(task);
-        return;
+    if (Worker *const me = currentWorker()) {
+        if (me->gathering) {
+            me->gather(task);
+            return;
+        }
+        if (not hasIdleWorkers()) {
+            me->pushLocalLifo(task);
+            return;
+        }
     }
     inject(task);
 }

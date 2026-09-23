@@ -44,12 +44,15 @@ struct Worker {
     // ping-pong pair cannot starve the queue.
     void pushLocalLifo(Task &task) noexcept;
     bool hasLocalWork() const noexcept;
+    // Appends to the batch being gathered (see `gathering`).
+    void gather(Task &task) noexcept;
 
     // --- cold (Worker.cpp) ------------------------------------------------
     // Dispatcher loop; returns when the scheduler has fully stopped.
     void run();
     Task *steal() noexcept;
     Task *searchForWork() noexcept;
+    void wakePeerForLeftovers() noexcept;
     // Bounded busy-wait as a searcher before sleeping.
     Task *spinForWork() noexcept;
     // Sleeps until notified; returns work found before or instead of sleeping.
@@ -57,6 +60,10 @@ struct Worker {
     void sleepIdle() noexcept;
     void maintain() noexcept;
     void reapParkedTasks() noexcept;
+    // Places the gathered batch. With `keepFirst` the first task is returned
+    // for this worker to run; the rest go to the injection queue behind a
+    // single wakeup (or stay local when no peer is idle).
+    Task *placeGathered(bool keepFirst) noexcept;
 
     SchedulerCore &core;
     std::size_t const index;
@@ -72,10 +79,25 @@ struct Worker {
     unsigned yieldTick = 0;
     std::uint32_t rng = 0;
     bool isSearching = false;
+    // Exponential backoff of idle spinning (see spinForWork).
+    unsigned spinMisses = 0;
+    unsigned spinSkips = 0;
+
+    // While set, schedule() on this thread gathers the tasks it wakes into a
+    // batch (linked through Task::mpscNext) instead of placing each one:
+    // firing timers or polling the driver, a burst of wakeups then costs one
+    // peer wakeup rather than one per task.
+    bool gathering = false;
+    Task *gatheredHead = nullptr;
+    Task *gatheredTail = nullptr;
 
     alignas(64) MpscQueue<Task> pinnedInbox;
     alignas(64) std::unique_ptr<Parker> parker;
     std::atomic<bool> running{false};
+    // Set by a peer worker that unparks us to hand over a task: we are in a
+    // worker-to-worker exchange, where spinning pays off even if it did not
+    // while the exchange ran through futex wakes. Foreign threads leave it.
+    std::atomic<bool> handoffWake{false};
 };
 
 // Post-switch hooks (Runtime.h). Each runs on the arriving side once the

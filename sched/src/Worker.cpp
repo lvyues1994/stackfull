@@ -33,6 +33,24 @@ std::uint32_t nextRandom(std::uint32_t &state) noexcept {
 // trick) so foreign work is never starved by a busy local queue.
 constexpr unsigned kInjectionCheckPeriod = 61;
 
+// Idle spinning is bounded by time, not iterations: a core just out of a
+// deep idle state runs slowly, and an iteration budget there costs tens of
+// microseconds. One spinner already spares producers their futex wake.
+constexpr std::chrono::microseconds kSpinBudget{5};
+constexpr std::uint32_t kMaxSpinners = 2;
+// From the second empty spin in a row, the next 2, 4, ... up to this many
+// idle episodes go straight to sleep before spinning is tried again. A
+// single miss (the peer was descheduled) does not stop a ping-pong.
+constexpr unsigned kMaxSpinBackoff = 32;
+
+inline void cpuRelax() noexcept {
+#if defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#elif defined(__aarch64__) || defined(__arm__)
+    asm volatile("yield" ::: "memory");
+#endif
+}
+
 } // namespace
 
 void *Worker::operator new(std::size_t const size) {
@@ -70,22 +88,25 @@ void Worker::run() {
         if (task == nullptr) {
             task = searchForWork();
         }
-        if (task != nullptr) {
-            ++tick;
-            coro::detail::switchTo(*dispatcher, *task);
-            continue; // some task handed control back to us
-        }
-
-        if (core.stopping.load(std::memory_order_acquire)) {
-            reapParkedTasks();
-            if (core.liveTasks.load(std::memory_order_acquire) == 0) {
-                break;
+        if (task == nullptr) {
+            if (core.stopping.load(std::memory_order_acquire)) {
+                reapParkedTasks();
+                if (core.liveTasks.load(std::memory_order_acquire) == 0) {
+                    break;
+                }
+            }
+            task = parkIdle();
+            if (task == nullptr) {
+                continue;
             }
         }
-        if (Task *const found = parkIdle()) {
-            ++tick;
-            coro::detail::switchTo(*dispatcher, *found);
+        ++tick;
+        // The task (and whatever it hands off to) may keep this worker away
+        // from its idle loop for a while; pending timers must not wait for it.
+        if (core.timekeeper.load(std::memory_order_relaxed) == nullptr) {
+            core.ensureTimekeeper();
         }
+        coro::detail::switchTo(*dispatcher, *task); // returns when a task hands control back
     }
 
     core.workersRunning.fetch_sub(1, std::memory_order_acq_rel);
@@ -151,30 +172,60 @@ Task *Worker::searchForWork() noexcept {
     if (searcher) {
         std::uint32_t const before = core.searching.fetch_sub(1, std::memory_order_acq_rel);
         if (task != nullptr and before == 1) {
-            core.notifyIdleWorker();
+            wakePeerForLeftovers();
         }
     }
     return task;
 }
 
-// Before sleeping, spin as a searcher for a while. Producers skip the futex
-// wake while any worker is searching, so a steady trickle of work never pays
-// a wake/sleep syscall pair per task. The spin is bounded (tens of µs) and
-// skipped during shutdown.
+// Producers that saw a searcher skipped their wakeup, so the last searcher
+// to find work wakes a peer — but only for work that is left over (more
+// injected tasks, or the rest of a stolen batch). A lone task wakes nobody
+// else. The fetch_sub on `searching` just before reads-from any such
+// producer's RMW, so its push is visible to these probes.
+void Worker::wakePeerForLeftovers() noexcept {
+    if (core.hasInjectedWork() or hasLocalWork()) {
+        core.notifyIdleWorker();
+    }
+}
+
+// Before sleeping, spin as a searcher for up to kSpinBudget. Producers skip
+// the futex wake while any worker is searching, so back-to-back handoffs
+// never pay a wake/sleep syscall pair. At most kMaxSpinners spin at once,
+// and spins that keep coming up empty back off exponentially: work arriving
+// less often than the budget costs a wakeup and almost no spinning, while a
+// switch back to rapid handoffs is picked up within kMaxSpinBackoff idle
+// episodes.
 Task *Worker::spinForWork() noexcept {
-    constexpr unsigned kSpinIterations = 2000;
-    core.searching.fetch_add(1, std::memory_order_seq_cst);
+    if (spinSkips != 0) {
+        --spinSkips;
+        return nullptr;
+    }
+    std::uint32_t current = core.searching.load(std::memory_order_relaxed);
+    do {
+        if (current >= kMaxSpinners) {
+            return nullptr;
+        }
+    } while (not core.searching.compare_exchange_weak(current, current + 1, std::memory_order_seq_cst,
+                                                      std::memory_order_relaxed));
+
     Task *task = nullptr;
-    for (unsigned i = 0; i < kSpinIterations and task == nullptr; ++i) {
+    auto const deadline = std::chrono::steady_clock::now() + kSpinBudget;
+    for (unsigned i = 1; task == nullptr; ++i) {
         task = takeLocal();
-        if (task == nullptr and (i & 7u) == 0) {
+        if (task == nullptr and core.hasInjectedWork()) {
             task = core.popInjection();
         }
-        if (task == nullptr and (i & 63u) == 63) {
+        if (task == nullptr and (i & 127u) == 0) {
             task = steal();
         }
+        if (task == nullptr and (i & 31u) == 0 and std::chrono::steady_clock::now() >= deadline) {
+            break;
+        }
+        cpuRelax();
     }
-    core.searching.fetch_sub(1, std::memory_order_seq_cst);
+
+    std::uint32_t const before = core.searching.fetch_sub(1, std::memory_order_seq_cst);
     // We may have been the searcher a producer relied on: re-check after
     // stepping down. A producer that saw us searching did its RMW on
     // `searching` before ours, so our RMW reads-from it and its push is
@@ -184,6 +235,18 @@ Task *Worker::spinForWork() noexcept {
     }
     if (task == nullptr) {
         task = core.popInjection();
+    }
+    if (task != nullptr) {
+        spinMisses = 0;
+        if (before == 1) {
+            wakePeerForLeftovers();
+        }
+    } else {
+        spinMisses = spinMisses < 16 ? spinMisses + 1 : spinMisses;
+        if (spinMisses >= 2) {
+            unsigned const backoff = 1u << (spinMisses - 1);
+            spinSkips = backoff < kMaxSpinBackoff ? backoff : kMaxSpinBackoff;
+        }
     }
     return task;
 }
@@ -216,24 +279,65 @@ Task *Worker::parkIdle() noexcept {
 
     sleepIdle();
     core.clearIdle(*this);
-    return nullptr;
+    if (handoffWake.exchange(false, std::memory_order_relaxed)) {
+        spinMisses = 0;
+        spinSkips = 0;
+    }
+    // Off the idle mask first, so the batch is not handed back to us.
+    return placeGathered(true);
 }
 
 // Periodic upkeep on a busy worker: fire due timers and, if nobody is
 // sleeping in the Driver, give it a non-blocking poll so IO readiness is
 // noticed even when every worker is busy.
 void Worker::maintain() noexcept {
+    gathering = true;
     core.fireTimers();
     if (core.driver != nullptr and core.tryBecomeTimekeeper(*this)) {
         core.driver->wait(std::chrono::nanoseconds{0});
         core.releaseTimekeeper(*this);
     }
+    gathering = false;
+    placeGathered(false);
+}
+
+Task *Worker::placeGathered(bool const keepFirst) noexcept {
+    Task *task = gatheredHead;
+    gatheredHead = nullptr;
+    gatheredTail = nullptr;
+    Task *kept = nullptr;
+    if (task != nullptr and keepFirst) {
+        kept = task;
+        task = task->mpscNext.load(std::memory_order_relaxed);
+    } else if (task != nullptr and task->mpscNext.load(std::memory_order_relaxed) == nullptr and not hasLocalWork()) {
+        // A lone wakeup on a worker with nothing else queued runs here next;
+        // waking a peer for it would only move it to a colder thread.
+        pushLocalLifo(*task);
+        return nullptr;
+    }
+    bool const feedPeers = core.hasIdleWorkers();
+    bool injected = false;
+    while (task != nullptr) {
+        Task *const following = task->mpscNext.load(std::memory_order_relaxed);
+        if (feedPeers) {
+            core.pushInjection(*task);
+            injected = true;
+        } else {
+            pushLocalFifo(*task);
+        }
+        task = following;
+    }
+    if (injected) {
+        core.notifyIdleWorker(); // one peer; searchers wake more while work is left
+    }
+    return kept;
 }
 
 // The actual sleep of an idle worker. One worker becomes the timekeeper and
 // sleeps with the earliest timer as timeout — inside the Driver when there
-// is one — then fires what came due; the others sleep on their Parker until
-// notified.
+// is one — then fires what came due, gathering the tasks it wakes so that
+// it runs one itself instead of waking a peer for it; the others sleep on
+// their Parker until notified.
 void Worker::sleepIdle() noexcept {
     bool const stopping = core.stopping.load(std::memory_order_acquire);
     if (not core.tryBecomeTimekeeper(*this)) {
@@ -256,6 +360,7 @@ void Worker::sleepIdle() noexcept {
         timeout = std::chrono::milliseconds{1};
     }
 
+    gathering = true;
     if (core.driver != nullptr) {
         core.driver->wait(timeout);
     } else if (timeout < std::chrono::nanoseconds{0}) {
@@ -265,6 +370,7 @@ void Worker::sleepIdle() noexcept {
     }
     core.releaseTimekeeper(*this);
     core.fireTimers();
+    gathering = false;
 }
 
 // Shutdown: claim every task still parked and end it. With exceptions the

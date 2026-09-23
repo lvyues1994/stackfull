@@ -105,10 +105,17 @@ void SchedulerCore::notifyIdleWorker() noexcept {
     }
     std::uint64_t mask = idleMask.fetch_or(0, std::memory_order_seq_cst);
     while (mask != 0) {
-        auto const index = static_cast<std::size_t>(__builtin_ctzll(mask));
+        std::uint64_t candidates = mask;
+        if (Worker const *const keeper = timekeeper.load(std::memory_order_relaxed)) {
+            std::uint64_t const keeperBit = std::uint64_t{1} << keeper->index;
+            if ((candidates & ~keeperBit) != 0) {
+                candidates &= ~keeperBit; // leave it asleep on the timers
+            }
+        }
+        auto const index = static_cast<std::size_t>(__builtin_ctzll(candidates));
         std::uint64_t const bit = std::uint64_t{1} << index;
         if (idleMask.compare_exchange_weak(mask, mask & ~bit, std::memory_order_acq_rel)) {
-            unparkWorker(*workers[index]);
+            handOffTo(*workers[index]);
             return;
         }
     }
@@ -116,9 +123,16 @@ void SchedulerCore::notifyIdleWorker() noexcept {
 
 void SchedulerCore::notifyWorker(Worker &worker) noexcept {
     if (clearIdle(worker)) {
-        unparkWorker(worker);
+        handOffTo(worker);
     }
     // Otherwise it is running and will drain its inbox at the next switch.
+}
+
+void SchedulerCore::handOffTo(Worker &worker) noexcept {
+    if (currentWorker() != nullptr) {
+        worker.handoffWake.store(true, std::memory_order_relaxed);
+    }
+    unparkWorker(worker);
 }
 
 bool SchedulerCore::tryBecomeTimekeeper(Worker &worker) noexcept {
@@ -142,14 +156,26 @@ void SchedulerCore::unparkWorker(Worker &worker) noexcept {
 }
 
 void SchedulerCore::addTimer(TimerEntry &entry) noexcept {
-    if (not timers.add(entry)) {
+    bool const earliest = timers.add(entry);
+    // The timer lock orders this load against a worker reading the heap
+    // after claiming the role: either we see it here or it sees the entry.
+    if (Worker *const keeper = timekeeper.load(std::memory_order_seq_cst)) {
+        if (earliest) {
+            unparkWorker(*keeper); // it sleeps with the old, later timeout
+        }
         return;
     }
-    // New earliest deadline: whoever is sleeping with the old timeout must
-    // recompute. The timer lock orders this against the timekeeper reading
-    // the heap after claiming the role.
-    if (Worker *const keeper = timekeeper.load(std::memory_order_seq_cst)) {
-        unparkWorker(*keeper);
+    // Nobody sleeps on the timers. The calling worker claims the role once
+    // it runs out of work; if it already has more lined up, a peer must.
+    Worker *const me = currentWorker();
+    if (me == nullptr or me->hasLocalWork()) {
+        ensureTimekeeper();
+    }
+}
+
+void SchedulerCore::ensureTimekeeper() noexcept {
+    if (timekeeper.load(std::memory_order_seq_cst) == nullptr and hasIdleWorkers() and not timers.isEmptyApprox()) {
+        notifyIdleWorker(); // a worker already searching claims the role when it sleeps
     }
 }
 

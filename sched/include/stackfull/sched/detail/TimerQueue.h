@@ -49,6 +49,9 @@ struct TimerQueue {
     // Earliest pending deadline, if any.
     bool nextDeadline(TimePoint &out) noexcept;
 
+    // Lock-free and possibly stale by one operation: scheduling heuristics only.
+    bool isEmptyApprox() const noexcept { return size.load(std::memory_order_relaxed) == 0; }
+
 private:
     void siftUp(std::size_t index) noexcept;
     void siftDown(std::size_t index) noexcept;
@@ -59,6 +62,7 @@ private:
     void unlock() noexcept { locked.store(false, std::memory_order_release); }
 
     std::vector<TimerEntry *> heap;
+    std::atomic<std::size_t> size{0}; // heap.size(), mirrored for isEmptyApprox()
 };
 
 } // namespace detail

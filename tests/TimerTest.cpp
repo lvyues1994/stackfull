@@ -116,6 +116,33 @@ TEST(Timer, FiresWhileAnotherWorkerIsBusy) {
     EXPECT_LT(slept.count(), 10 + 30);
 }
 
+// The timekeeper runs the task its timer woke; if that task then never
+// yields, the timers still pending must pass to an idle peer.
+TEST(Timer, PendingTimersOutliveATimekeeperThatGotBusy) {
+    auto scheduler = startScheduler(2);
+    WaitGroup done;
+    done.add(2);
+    std::atomic<bool> stopSpinning{false};
+    milliseconds slept{0};
+    ASSERT_TRUE(scheduler->spawn([&] {
+        this_task::sleepFor(milliseconds{5});
+        auto const giveUp = Clock::now() + milliseconds{500};
+        while (not stopSpinning.load() and Clock::now() < giveUp) {
+        }
+        done.done();
+    }));
+    ASSERT_TRUE(scheduler->spawn([&] {
+        auto const start = Clock::now();
+        this_task::sleepFor(milliseconds{20});
+        slept = elapsedSince(start);
+        stopSpinning.store(true);
+        done.done();
+    }));
+    done.wait();
+    EXPECT_GE(slept.count(), 20);
+    EXPECT_LT(slept.count(), 20 + 30);
+}
+
 // The timekeeper sleeps with the earliest deadline as its timeout; a new,
 // earlier timer must cut that sleep short.
 TEST(Timer, EarlierDeadlineShortensTheTimekeepersSleep) {

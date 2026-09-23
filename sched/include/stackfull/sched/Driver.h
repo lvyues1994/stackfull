@@ -14,7 +14,9 @@ namespace sched {
 // wait() must return after `timeout` (or sooner), or as soon as wake() is
 // called from any thread, and must deliver readiness by waking tasks
 // (WakeToken::wake()) before returning. It runs on a worker thread while
-// that worker is idle, so it must not block for longer than asked.
+// that worker is idle, so it must not block for longer than asked. Tasks it
+// wakes are placed as one batch when it returns (the calling worker runs
+// the first), so it must also return promptly once it has delivered.
 struct Driver {
     virtual ~Driver() = default;
 

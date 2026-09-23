@@ -57,12 +57,19 @@ struct SchedulerCore {
     // --- hot, inline (Runtime.h) ------------------------------------------
     void schedule(Task &task) noexcept;
     void wake(Task &task) noexcept;
+    // Injection queue push, then notifyIdleWorker().
     void inject(Task &task) noexcept;
+    // Injection queue push alone; the caller wakes a worker for the batch.
+    void pushInjection(Task &task) noexcept;
     Worker *currentWorker() noexcept;
     bool hasIdleWorkers() const noexcept;
+    // Racy; true means a pop may succeed. Scheduling heuristics only.
+    bool hasInjectedWork() const noexcept;
 
     // --- cold (SchedulerCore.cpp) -------------------------------------------
     // Unpark one idle worker unless a searching worker will pick the work up.
+    // The timekeeper is chosen only when it is the sole idle worker, so the
+    // timers keep a sleeper.
     void notifyIdleWorker() noexcept;
     // Unpark a specific worker if it is idle (pinned wakeups).
     void notifyWorker(Worker &worker) noexcept;
@@ -83,10 +90,17 @@ struct SchedulerCore {
     // Unpark a worker wherever it sleeps: its Parker, or the Driver if it is
     // the timekeeper inside Driver::wait().
     void unparkWorker(Worker &worker) noexcept;
+    // unparkWorker() for new work, flagging whether a peer worker sent it.
+    void handOffTo(Worker &worker) noexcept;
     // Queue a deadline; shortens the timekeeper's sleep if it became earliest.
     void addTimer(TimerEntry &entry) noexcept;
     // Fire what is due; any worker may call this.
     void fireTimers() noexcept;
+    // Pending timers with nobody holding the timekeeper role: wake an idle
+    // peer, which claims the role on its way back to sleep. Called by a
+    // worker about to run tasks, which may keep it away from its own idle
+    // loop for a while.
+    void ensureTimekeeper() noexcept;
 
     SchedulerOptions options;
     stack::StackAllocator *allocator = nullptr;

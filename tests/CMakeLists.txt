@@ -26,7 +26,9 @@ function(stackfull_add_test name)
         # recent kernels ("unexpected memory mapping"); run tests without ASLR.
         set_property(TARGET ${name} PROPERTY TEST_LAUNCHER setarch ${CMAKE_HOST_SYSTEM_PROCESSOR} -R)
     endif()
-    gtest_discover_tests(${name} DISCOVERY_MODE PRE_TEST PROPERTIES LABELS ${arg_LABEL})
+    # A task body that returns early (a failed ASSERT) can leave the test
+    # waiting forever; the timeout turns such a hang into a failure.
+    gtest_discover_tests(${name} DISCOVERY_MODE PRE_TEST PROPERTIES LABELS ${arg_LABEL} TIMEOUT 60)
 endfunction()
 
 stackfull_add_test(stackfull_fcontext_test LABEL coro LIBS stackfull::coro SOURCES FcontextTest.cpp)
