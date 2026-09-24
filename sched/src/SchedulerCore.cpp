@@ -220,10 +220,54 @@ void SchedulerCore::addTimer(TimerEntry &entry) noexcept {
     }
 }
 
+// A worker woken here may find leftover work before it gets to claim the
+// role, and would then call this again from its own dispatch: without a
+// limit, one burst wakes worker after worker. So at most one such wakeup
+// per rampUpDelay; timers stay covered, just up to that much later.
 void SchedulerCore::ensureTimekeeper() noexcept {
-    if (timekeeper.load(std::memory_order_seq_cst) == nullptr and hasIdleWorkers() and hasPendingTimers()) {
-        notifyIdleWorker(); // a worker already searching claims the role when it sleeps
+    if (timekeeper.load(std::memory_order_seq_cst) != nullptr or not hasIdleWorkers() or not hasPendingTimers()) {
+        return;
     }
+    if (options.rampUpDelay.count() > 0) {
+        std::int64_t const now = ticksOf(std::chrono::steady_clock::now());
+        std::int64_t last = lastKeeperWake.load(std::memory_order_relaxed);
+        std::int64_t const spacing =
+            std::chrono::duration_cast<std::chrono::steady_clock::duration>(options.rampUpDelay).count();
+        if (now - last < spacing or not lastKeeperWake.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
+            return;
+        }
+    }
+    notifyIdleWorker(); // a worker already searching claims the role when it sleeps
+}
+
+// Same protocol as addTimer(): the request is published (seq_cst) before
+// the timekeeper and its deadline are read, and the timekeeper reads it
+// after marking itself as scanning.
+void SchedulerCore::requestRampUp() noexcept {
+    if (options.rampUpDelay.count() <= 0) {
+        notifyIdleWorker();
+        return;
+    }
+    if (not hasIdleWorkers()) {
+        return;
+    }
+    std::int64_t const due =
+        ticksOf(std::chrono::steady_clock::now() +
+                std::chrono::duration_cast<std::chrono::steady_clock::duration>(options.rampUpDelay));
+    std::int64_t current = rampUpDeadline.load(std::memory_order_relaxed);
+    do {
+        if (current <= due) {
+            return; // an earlier request is pending
+        }
+    } while (not rampUpDeadline.compare_exchange_weak(current, due, std::memory_order_seq_cst,
+                                                      std::memory_order_relaxed));
+    if (Worker *const keeper = timekeeper.load(std::memory_order_seq_cst)) {
+        if (due < keeperDeadline.load(std::memory_order_seq_cst)) {
+            unparkWorker(*keeper);
+        }
+        return;
+    }
+    notifyIdleWorker(); // nobody sleeps with a timeout to honour it
 }
 
 bool SchedulerCore::hasPendingTimers() const noexcept {

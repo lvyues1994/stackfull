@@ -3,7 +3,8 @@
 
 add_library(stackfull_runtime STATIC
     include/stackfull/runtime/Runtime.h
-    src/Runtime.cpp)
+    src/Runtime.cpp
+    src/Blocking.cpp)
 add_library(stackfull::runtime ALIAS stackfull_runtime)
 
 target_include_directories(stackfull_runtime PUBLIC include)

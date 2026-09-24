@@ -76,12 +76,15 @@ struct Worker {
     Task *lifoSlot = nullptr;
     unsigned lifoStreak = 0;
     unsigned tick = 0;
-    unsigned yieldTick = 0;
+    std::atomic<unsigned> yieldTick{0}; // also read by the stall monitor
     std::uint32_t rng = 0;
     bool isSearching = false;
     // Exponential backoff of idle spinning (see spinForWork).
     unsigned spinMisses = 0;
     unsigned spinSkips = 0;
+    // Bumped whenever a task parks or finishes; the stall monitor watches it
+    // together with yieldTick.
+    std::atomic<std::uint32_t> switchCount{0};
 
     // While set, schedule() on this thread gathers the tasks it wakes into a
     // batch (linked through Task::mpscNext) instead of placing each one:

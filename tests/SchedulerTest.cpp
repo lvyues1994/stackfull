@@ -1,3 +1,4 @@
+#include <stackfull/sched/Affinity.h>
 #include <stackfull/sched/Scheduler.h>
 #include <stackfull/sched/ThisTask.h>
 #include <stackfull/stack/MmapStackAllocator.h>
@@ -17,6 +18,9 @@
 #include <vector>
 
 #include <sys/mman.h>
+#if defined(__linux__)
+#include <sched.h>
+#endif
 
 #if STACKFULL_HAS_EXCEPTIONS
 #include <exception>
@@ -543,6 +547,109 @@ TEST(SchedulerDeath, StackCanaryCatchesAnOverflowWithoutGuardPage) {
             }
         },
         "stack overflow");
+}
+
+TEST(Scheduler, WorkerStartHookRunsOnEveryWorker) {
+    std::mutex mutex;
+    std::set<std::size_t> started;
+    SchedulerOptions options = withWorkers(3);
+    options.onWorkerStart = [&](std::size_t const index) {
+        std::lock_guard<std::mutex> const lock(mutex);
+        started.insert(index);
+    };
+    auto scheduler = makeScheduler(options);
+    auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds{2};
+    for (;;) {
+        {
+            std::lock_guard<std::mutex> const lock(mutex);
+            if (started.size() == 3 or std::chrono::steady_clock::now() > deadline) {
+                break;
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+    std::lock_guard<std::mutex> const lock(mutex);
+    EXPECT_EQ(started, (std::set<std::size_t>{0, 1, 2}));
+}
+
+#if defined(__linux__)
+TEST(Scheduler, WorkersPinnedFromTheStartHookRunThere) {
+    SchedulerOptions options = withWorkers(2);
+    std::atomic<int> pinErrors{0};
+    options.onWorkerStart = [&](std::size_t) {
+        if (pinCurrentThreadToCpus({0})) {
+            pinErrors.fetch_add(1);
+        }
+    };
+    auto scheduler = makeScheduler(options);
+    std::atomic<int> otherCpu{0};
+    for (int i = 0; i < 50; ++i) {
+        ASSERT_TRUE(scheduler->spawn([&] {
+            if (::sched_getcpu() != 0) {
+                otherCpu.fetch_add(1);
+            }
+        }));
+    }
+    ASSERT_TRUE(waitIdle(*scheduler));
+    EXPECT_EQ(pinErrors.load(), 0);
+    EXPECT_EQ(otherCpu.load(), 0);
+}
+#endif
+
+namespace {
+
+struct RecordingStallSink final : StallSink {
+    void onStall(std::size_t const worker, std::chrono::milliseconds const stalledFor) noexcept override {
+        std::lock_guard<std::mutex> const lock(mutex);
+        reports.emplace_back(worker, stalledFor);
+    }
+    std::size_t count() {
+        std::lock_guard<std::mutex> const lock(mutex);
+        return reports.size();
+    }
+    std::mutex mutex;
+    std::vector<std::pair<std::size_t, std::chrono::milliseconds>> reports;
+};
+
+} // namespace
+
+TEST(Scheduler, StallMonitorReportsATaskThatNeverYields) {
+    RecordingStallSink sink;
+    SchedulerOptions options = withWorkers(2);
+    options.stallThreshold = std::chrono::milliseconds{30};
+    options.stallSink = &sink;
+    auto scheduler = makeScheduler(options);
+    ASSERT_TRUE(scheduler->spawn([] {
+        auto const until = std::chrono::steady_clock::now() + std::chrono::milliseconds{150};
+        while (std::chrono::steady_clock::now() < until) {
+        }
+    }));
+    ASSERT_TRUE(waitIdle(*scheduler));
+    std::this_thread::sleep_for(std::chrono::milliseconds{20});
+    ASSERT_EQ(sink.count(), 1u); // once per episode
+    EXPECT_GE(sink.reports[0].second.count(), 30);
+}
+
+TEST(Scheduler, StallMonitorIgnoresTasksThatYield) {
+    RecordingStallSink sink;
+    SchedulerOptions options = withWorkers(2);
+    options.stallThreshold = std::chrono::milliseconds{30};
+    options.stallSink = &sink;
+    auto scheduler = makeScheduler(options);
+    for (int t = 0; t < 2; ++t) {
+        ASSERT_TRUE(scheduler->spawn([] {
+            auto const until = std::chrono::steady_clock::now() + std::chrono::milliseconds{150};
+            while (std::chrono::steady_clock::now() < until) {
+                auto const slice = std::chrono::steady_clock::now() + std::chrono::milliseconds{1};
+                while (std::chrono::steady_clock::now() < slice) {
+                }
+                this_task::yield();
+            }
+        }));
+    }
+    ASSERT_TRUE(waitIdle(*scheduler));
+    std::this_thread::sleep_for(std::chrono::milliseconds{50}); // idle workers are not stalls either
+    EXPECT_EQ(sink.count(), 0u);
 }
 
 TEST(Scheduler, SpawnFailsBeyondMaxTasks) {

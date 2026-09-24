@@ -4,8 +4,10 @@
 #include <stackfull/coro/ForcedUnwind.h>
 #include <stackfull/io/Poller.h>
 #include <stackfull/sched/Scheduler.h>
+#include <stackfull/sched/ThisTask.h>
 #include <stackfull/sync/Completion.h>
 
+#include <memory>
 #include <type_traits>
 #include <utility>
 
@@ -123,6 +125,46 @@ auto blockOn(sched::Scheduler &scheduler, F &&body) -> typename std::decay<declt
 template <class F>
 auto blockOn(F &&body) -> typename std::decay<decltype(body())>::type {
     return blockOn(defaultScheduler(), std::forward<F>(body));
+}
+
+namespace detail {
+
+struct BlockingJob {
+    virtual ~BlockingJob() = default;
+    virtual void run() = 0;
+};
+
+template <class R, class F>
+struct BlockingJobImpl final : BlockingJob {
+    BlockingJobImpl(sync::Completion<R> completion_, F &&body_)
+        : completion(std::move(completion_)), body(std::forward<F>(body_)) {}
+    void run() override { runGuarded(completion, body); }
+
+    sync::Completion<R> completion;
+    typename std::decay<F>::type body;
+};
+
+// The blocking pool: threads created on demand (at most 64), idle ones exit
+// after ten seconds. Never destroyed.
+void submitBlocking(std::unique_ptr<BlockingJob> job);
+
+} // namespace detail
+
+// Runs `body` on a thread of the blocking pool and hands back its value
+// (rethrowing its exception when exceptions are enabled). The calling task
+// parks meanwhile, so its worker keeps running other tasks: wrap calls that
+// block the thread, such as file IO, DNS lookups or synchronous SDK calls.
+// From a plain thread, `body` simply runs inline.
+template <class F>
+auto blocking(F &&body) -> typename std::decay<decltype(body())>::type {
+    using R = typename std::decay<decltype(body())>::type;
+    if (not sched::this_task::isTask()) {
+        return body();
+    }
+    sync::Completion<R> completion;
+    detail::submitBlocking(std::unique_ptr<detail::BlockingJob>(
+        new detail::BlockingJobImpl<R, F>(completion, std::forward<F>(body))));
+    return detail::unwrap<R>(completion.get(), std::is_void<R>{});
 }
 
 } // namespace stackfull

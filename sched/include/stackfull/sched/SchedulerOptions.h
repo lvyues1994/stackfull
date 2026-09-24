@@ -3,7 +3,9 @@
 #include <stackfull/coro/Config.h>
 #include <stackfull/stack/StackAllocator.h>
 
+#include <chrono>
 #include <cstddef>
+#include <functional>
 #include <system_error>
 
 #if STACKFULL_HAS_EXCEPTIONS
@@ -24,6 +26,14 @@ struct ExceptionSink {
     virtual void onUnhandledException(std::exception_ptr exception) noexcept = 0;
 };
 #endif
+
+// Told about a worker that has been running one task for longer than
+// SchedulerOptions::stallThreshold without it yielding, parking or finishing.
+// Called on the scheduler's monitor thread.
+struct StallSink {
+    virtual ~StallSink() = default;
+    virtual void onStall(std::size_t workerIndex, std::chrono::milliseconds stalledFor) noexcept = 0;
+};
 
 struct SchedulerOptions {
     // 0 selects std::thread::hardware_concurrency(). At most 64.
@@ -54,6 +64,22 @@ struct SchedulerOptions {
     // Borrowed; nullptr selects the aborting default.
     ExceptionSink *exceptionSink = nullptr;
 #endif
+    // Runs on each worker thread, with its index, before the worker takes
+    // any task: set CPU affinity (pinCurrentThreadToCpus), priority or
+    // scheduling policy here. Must not throw.
+    std::function<void(std::size_t workerIndex)> onWorkerStart;
+    // A worker that keeps running one task this long without a switch is
+    // reported to stallSink, once per episode. 0 disables the monitor thread
+    // (which otherwise wakes every stallThreshold / 2).
+    std::chrono::milliseconds stallThreshold{0};
+    // Borrowed; nullptr prints to stderr.
+    StallSink *stallSink = nullptr;
+    // When a worker finds work and more is left over, the next idle worker
+    // joins only after this long, and only if the backlog is still there:
+    // a burst of short tasks is then drained by the workers already awake
+    // instead of waking one after another. The first helper for a batch is
+    // always woken at once. 0 restores immediate ramp-up.
+    std::chrono::microseconds rampUpDelay{50};
 };
 
 struct TaskOptions {

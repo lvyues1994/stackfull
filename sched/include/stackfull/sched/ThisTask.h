@@ -25,7 +25,11 @@ namespace this_task {
 STACKFULL_ALWAYS_INLINE void yield() {
     detail::CurrentTask const current = detail::currentTask();
     detail::Worker &worker = current.worker;
-    bool const fairnessTick = (++worker.yieldTick & 63u) == 0;
+    // Counts as progress for the stall monitor, even when nothing else is
+    // runnable; owner-only, so a relaxed load and store (a plain increment).
+    unsigned const yields = worker.yieldTick.load(std::memory_order_relaxed) + 1;
+    worker.yieldTick.store(yields, std::memory_order_relaxed);
+    bool const fairnessTick = (yields & 63u) == 0;
     if (fairnessTick) {
         if (detail::Task *const injected = worker.core.popInjection()) {
             worker.pushLocalFifo(*injected);
@@ -49,6 +53,7 @@ STACKFULL_ALWAYS_INLINE void yield() {
 STACKFULL_ALWAYS_INLINE void park() {
     detail::CurrentTask const current = detail::currentTask();
     detail::Task &task = current.task;
+    detail::countSwitch(current.worker);
     if (task.parkState.load(std::memory_order_acquire) == detail::raw(detail::TaskState::Notified)) {
         task.parkState.store(detail::raw(detail::TaskState::Running), std::memory_order_relaxed);
         return; // consume the pending token without switching

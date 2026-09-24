@@ -120,6 +120,9 @@ struct SchedulerCore {
     // worker about to run tasks, which may keep it away from its own idle
     // loop for a while.
     void ensureTimekeeper() noexcept;
+    // More work is left over: have an idle worker join after rampUpDelay,
+    // through the timekeeper's timeout (see SchedulerOptions::rampUpDelay).
+    void requestRampUp() noexcept;
 
     SchedulerOptions options;
     stack::StackAllocator *allocator = nullptr;
@@ -148,6 +151,10 @@ struct SchedulerCore {
     // When the timekeeper will wake at the latest (kNoDeadline: only when
     // woken), or kScanningTimers while it looks for the earliest deadline.
     std::atomic<std::int64_t> keeperDeadline{kNoDeadline};
+    // Earliest pending ramp-up request, or kNoDeadline.
+    std::atomic<std::int64_t> rampUpDeadline{kNoDeadline};
+    // When ensureTimekeeper() last woke a worker (steady_clock ticks).
+    std::atomic<std::int64_t> lastKeeperWake{std::numeric_limits<std::int64_t>::min() / 2};
     static constexpr std::int64_t kScanningTimers = std::numeric_limits<std::int64_t>::min();
 };
 

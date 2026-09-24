@@ -201,6 +201,10 @@ inline void SchedulerCore::wake(Task &task) noexcept {
 // Runs on the arriving side after `task` switched out, so its saved stack
 // pointer (fctx) is current: below the canary line means it is deeper than
 // its stack right now; a damaged canary means it was at some point.
+STACKFULL_ALWAYS_INLINE void countSwitch(Worker &worker) noexcept {
+    worker.switchCount.store(worker.switchCount.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+}
+
 STACKFULL_ALWAYS_INLINE void checkStackCanary(Task const &task) noexcept {
     if (task.stackCanary == nullptr) {
         return;
@@ -246,6 +250,7 @@ inline void onTaskParked(coro::detail::ContextBlock &suspended, void *const arg)
 inline void onTaskFinished(coro::detail::ContextBlock &finished, void *const arg) noexcept {
     Worker &worker = *static_cast<Worker *>(arg);
     checkStackCanary(static_cast<Task &>(finished));
+    countSwitch(worker);
     worker.core.releaseTask(static_cast<Task &>(finished));
 }
 

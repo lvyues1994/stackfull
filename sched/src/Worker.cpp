@@ -13,7 +13,10 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
+
+#include <pthread.h>
 
 namespace stackfull {
 namespace sched {
@@ -42,6 +45,17 @@ constexpr std::uint32_t kMaxSpinners = 2;
 // idle episodes go straight to sleep before spinning is tried again. A
 // single miss (the peer was descheduled) does not stop a ping-pong.
 constexpr unsigned kMaxSpinBackoff = 32;
+
+// "sf-worker-<n>" in debuggers and top -H (at most 15 characters).
+void nameCurrentThread(std::size_t const index) noexcept {
+#if defined(__linux__) || defined(__QNX__)
+    char name[16];
+    std::snprintf(name, sizeof name, "sf-worker-%zu", index);
+    ::pthread_setname_np(::pthread_self(), name);
+#else
+    static_cast<void>(index);
+#endif
+}
 
 inline void cpuRelax() noexcept {
 #if defined(__x86_64__) || defined(__i386__)
@@ -72,6 +86,10 @@ Worker::Worker(SchedulerCore &core_, std::size_t const index_)
 }
 
 void Worker::run() {
+    nameCurrentThread(index);
+    if (core.options.onWorkerStart) {
+        core.options.onWorkerStart(index);
+    }
     thread = &coro::detail::currentThreadState();
     thread->worker = this;
     dispatcher = &thread->mainBlock;
@@ -187,7 +205,7 @@ Task *Worker::searchForWork() noexcept {
 // producer's RMW, so its push is visible to these probes.
 void Worker::wakePeerForLeftovers() noexcept {
     if (core.hasInjectedWork() or hasLocalWork()) {
-        core.notifyIdleWorker();
+        core.requestRampUp();
     }
 }
 
@@ -352,16 +370,18 @@ void Worker::sleepIdle() noexcept {
     }
 
     std::chrono::nanoseconds timeout{-1};
-    // While we look, any task adding a timer wakes us (see addTimer).
+    // While we look, any task adding a timer or requesting ramp-up wakes us
+    // (see addTimer, requestRampUp).
     core.keeperDeadline.store(SchedulerCore::kScanningTimers, std::memory_order_seq_cst);
     TimePoint deadline;
-    bool const anyTimer = core.nextDeadline(deadline);
-    if (anyTimer) {
-        auto const now = std::chrono::steady_clock::now();
-        timeout = deadline > now ? std::chrono::duration_cast<std::chrono::nanoseconds>(deadline - now)
-                                 : std::chrono::nanoseconds{0};
+    std::int64_t wakeAt = core.nextDeadline(deadline) ? ticksOf(deadline) : kNoDeadline;
+    std::int64_t const rampUp = core.rampUpDeadline.load(std::memory_order_seq_cst);
+    wakeAt = rampUp < wakeAt ? rampUp : wakeAt;
+    if (wakeAt != kNoDeadline) {
+        std::int64_t const now = ticksOf(std::chrono::steady_clock::now());
+        timeout = std::chrono::nanoseconds{wakeAt > now ? wakeAt - now : 0};
     }
-    core.keeperDeadline.store(anyTimer ? ticksOf(deadline) : kNoDeadline, std::memory_order_seq_cst);
+    core.keeperDeadline.store(wakeAt, std::memory_order_seq_cst);
     if (stopping and (timeout < std::chrono::nanoseconds{0} or timeout > std::chrono::milliseconds{1})) {
         timeout = std::chrono::milliseconds{1};
     }
@@ -377,6 +397,12 @@ void Worker::sleepIdle() noexcept {
     core.releaseTimekeeper(*this);
     core.fireTimers();
     gathering = false;
+    // A due ramp-up request is ours to answer: back in the run loop we take
+    // leftover work if it is still there (and request the next step).
+    std::int64_t due = core.rampUpDeadline.load(std::memory_order_acquire);
+    if (due != kNoDeadline and due <= ticksOf(std::chrono::steady_clock::now())) {
+        core.rampUpDeadline.compare_exchange_strong(due, kNoDeadline, std::memory_order_acq_rel);
+    }
 }
 
 // Shutdown: claim every task still parked and end it. With exceptions the

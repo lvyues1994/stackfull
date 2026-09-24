@@ -535,6 +535,62 @@ TEST(Runtime, DefaultSchedulerDoesIoThroughDefaultPoller) {
     EXPECT_EQ(reply, "pong");
 }
 
+TEST(Runtime, BlockingKeepsTheWorkerFree) {
+    SchedulerOptions options;
+    options.workers = 1; // a blocked worker would stall everything
+    auto scheduler = makeScheduler(options);
+    std::atomic<int> ticks{0};
+    std::atomic<bool> stop{false};
+    int result = 0;
+    int ticksWhileBlocked = 0;
+    WaitGroup done;
+    done.add(2);
+    ASSERT_TRUE(scheduler->spawn([&] {
+        while (not stop.load()) {
+            this_task::sleepFor(milliseconds{1});
+            ticks.fetch_add(1);
+        }
+        done.done();
+    }));
+    ASSERT_TRUE(scheduler->spawn([&] {
+        int const before = ticks.load();
+        result = blocking([] {
+            std::this_thread::sleep_for(milliseconds{60}); // a truly blocking call
+            return 7;
+        });
+        ticksWhileBlocked = ticks.load() - before;
+        stop.store(true);
+        done.done();
+    }));
+    done.wait();
+    EXPECT_EQ(result, 7);
+    EXPECT_GE(ticksWhileBlocked, 10);
+}
+
+TEST(Runtime, BlockingFromAPlainThreadRunsInline) {
+    std::thread::id ranOn;
+    int const value = blocking([&] {
+        ranOn = std::this_thread::get_id();
+        return 3;
+    });
+    EXPECT_EQ(value, 3);
+    EXPECT_EQ(ranOn, std::this_thread::get_id());
+}
+
+#if STACKFULL_HAS_EXCEPTIONS
+TEST(Runtime, BlockingRethrowsInTheTask) {
+    bool caught = blockOn([] {
+        try {
+            blocking([]() -> int { throw std::runtime_error("disk on fire"); });
+        } catch (std::runtime_error const &) {
+            return true;
+        }
+        return false;
+    });
+    EXPECT_TRUE(caught);
+}
+#endif
+
 TEST(Runtime, BlockOnVoid) {
     bool ran = false;
     blockOn([&] { ran = true; });

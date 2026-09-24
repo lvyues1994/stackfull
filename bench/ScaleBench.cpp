@@ -1,6 +1,6 @@
 // Multicore scaling, per-task footprint and wake latency.
 //
-//   stackfull_scale_bench [scale|yield|spawn|pingpong|mem|lat|all]
+//   stackfull_scale_bench [scale|yield|spawn|pingpong|burst|mem|lat|all]
 //
 // bench/tokio-compare runs the same cases on Tokio for reference.
 
@@ -22,6 +22,8 @@
 #include <memory>
 #include <mutex>
 #include <string>
+
+#include <sys/resource.h>
 #include <thread>
 #include <vector>
 
@@ -188,6 +190,47 @@ void scalePingPong(std::size_t const workers) {
     }
     std::printf("park/wake    %2zu workers  %8.2f M handoffs/s over %zu pairs\n", workers,
                 static_cast<double>(total) / seconds / 1e6, pairs.size());
+}
+
+double processCpuSeconds() {
+    rusage usage{};
+    ::getrusage(RUSAGE_SELF, &usage);
+    return static_cast<double>(usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) +
+           static_cast<double>(usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) * 1e-6;
+}
+
+// A foreign thread spawns `count` tasks at once, each busy for `work`:
+// completion time against the ideal (all workers busy from the start) and
+// the CPU the process burnt, with and without delayed ramp-up.
+void burst(std::size_t const workers, int const count, microseconds const work, microseconds const rampUpDelay) {
+    SchedulerOptions options;
+    options.workers = workers;
+    options.taskStackSize = 64 * 1024;
+    options.rampUpDelay = rampUpDelay;
+    auto scheduler = makeScheduler(options);
+    std::this_thread::sleep_for(milliseconds{100}); // everyone asleep
+    std::atomic<int> done{0};
+    double const cpuBefore = processCpuSeconds();
+    auto const start = Clock::now();
+    for (int i = 0; i < count; ++i) {
+        scheduler->spawn([&done, work] {
+            auto const until = Clock::now() + work;
+            while (Clock::now() < until) {
+            }
+            done.fetch_add(1, std::memory_order_relaxed);
+        });
+    }
+    while (done.load(std::memory_order_relaxed) < count) {
+        std::this_thread::yield();
+    }
+    double const seconds = std::chrono::duration<double>(Clock::now() - start).count();
+    double const cpu = processCpuSeconds() - cpuBefore - seconds; // minus the polling main thread
+    double const ideal = static_cast<double>(count) * 1e-6 * static_cast<double>(work.count()) /
+                         static_cast<double>(workers);
+    std::printf("burst %4d x %4ldus, %2zu workers, ramp-up delay %3ldus: done in %7.2f ms (ideal %6.2f), "
+                "scheduler CPU %7.2f ms\n",
+                count, static_cast<long>(work.count()), workers, static_cast<long>(rampUpDelay.count()),
+                1e3 * seconds, 1e3 * ideal, 1e3 * (cpu > 0 ? cpu : 0));
 }
 
 long statusKiB(char const *const field) {
@@ -410,6 +453,12 @@ int main(int const argc, char **const argv) {
     if (scale or what == "pingpong") {
         for (std::size_t const workers : counts) {
             scalePingPong(workers);
+        }
+    }
+    if (what == "all" or what == "burst") {
+        for (microseconds const delay : {microseconds{0}, microseconds{50}}) {
+            burst(24, 2000, microseconds{1}, delay);
+            burst(24, 1000, microseconds{200}, delay);
         }
     }
     if (what == "all" or what == "mem") {

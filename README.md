@@ -88,17 +88,25 @@ int main() {
     return blockOn([] {                    // 在进程级默认调度器上跑，阻塞 main 线程直到返回
         go([] { backgroundWork(); });      // fire-and-forget
         auto answer = async([] { return compute(); });   // Completion<int>
+        auto text = blocking([] { return readWholeFile("/etc/config"); });  // 阻塞调用交给阻塞线程池，worker 不被占住
         return answer.get().value;
     });
 }
 ```
+
+其他选项：
+
+- `onWorkerStart(index)`：每个 worker 线程开始跑任务前调用，在这里绑核（`sched::pinCurrentThreadToCpus({4, 5, 6, 7})`，Linux/Android 用 `sched_setaffinity`，QNX 用 runmask）、设优先级或实时调度策略。worker 线程名为 `sf-worker-N`。
+- `stallThreshold` / `stallSink`：某个 worker 在一个任务上连续这么久没有 yield/park/结束，就报告一次（默认打印到 stderr）；由一个每半个阈值醒一次的监视线程完成，默认关闭。
+- `rampUpDelay`（默认 50 µs）：找到活且还有剩余时，下一个空闲 worker 延迟这么久、并且积压仍在才加入；一批短任务由已醒的 worker 清掉，不再逐个唤醒。为计时角色叫醒同伴也按同一间隔节流。设 0 恢复立即扩容。
+- `blocking(fn)`：在任务里调用时，`fn` 在按需伸缩的阻塞线程池上执行（最多 64 个线程，空闲 10 秒退出），任务 park 等结果并接收其异常；普通线程里调用则就地执行。
 
 设计要点：
 
 - **本地队列 BWoS**（OSDI'23，自 Tokio 参考实现移植，`queue/PROVENANCE.md`）：owner 快路径块内 relaxed 原子、零屏障；窃取按块。全局注入队列 **BBQ**（ATC'22）无锁 MPMC，容量绑定 `maxTasks` 故永不满；slab 空闲索引同样用 BBQ。`-DSTACKFULL_SCHED_QUEUE=RING` 切换到 Go 风格环形队列做对照。
 - **直接交接**：`yield/park/结束` 在任务栈上取下一个本地任务并一次切换过去；`PostSwitchHook` 在到达方执行重入队 / park 状态迁移 / 释放栈，保证任务寄存器保存完毕后才可能被别的线程恢复。
 - **park/wake 协议**：`Running → Parked → Notified → Running` 两侧各一次原子操作，无锁无自旋；wake 令牌粘滞，早到的 wake 让下一次 park 立即返回。park 一侧用 CAS `Running → Parked`，若已被唤醒（Notified）则直接回到 Running 并重排——Parked 哪怕短暂出现一瞬，第二个唤醒者也会再调度一次，任务被恢复两次（曾经的 bug，`ConcurrentWakesScheduleAParkingTaskOnce` 覆盖）。`WakeToken` 是 `(slot, generation)`，释放时等待 pin 计数归零，过期令牌安全。
-- **放置策略**：pinned → 所属 worker 收件箱；有空闲 worker → 注入队列 + unpark 一个（BWoS 偷不到短队列，空闲者要喂而不是让它偷）；全忙 → 本地 LIFO 槽（连续 3 次后让队列）；外部线程 → 注入队列。计时线程触发定时器或轮询 Driver 时把唤醒的任务收成一批：第一个自己跑，其余进注入队列只唤醒一个同伴；最后一个搜索者只在还有剩余工作时才继续唤醒下一个。孤立事件因此只唤醒一个线程。
+- **放置策略**：pinned → 所属 worker 收件箱；有空闲 worker → 注入队列 + unpark 一个（BWoS 偷不到短队列，空闲者要喂而不是让它偷）；全忙 → 本地 LIFO 槽（连续 3 次后让队列）；外部线程 → 注入队列。计时线程触发定时器或轮询 Driver 时把唤醒的任务收成一批：第一个自己跑，其余进注入队列只唤醒一个同伴；最后一个搜索者只在还有剩余工作时才请求下一个加入（经计时线程延迟 `rampUpDelay`，届时积压仍在才真正加入）。孤立事件因此只唤醒一个线程，一批短任务也不再逐个唤醒整个线程池。
 - **空闲自旋**：按时间限制（5 µs，而不是迭代次数——刚出深度空闲的核频率低，迭代预算会拖成几十微秒），同时最多 2 个 worker 自旋；连续落空后按 2、4…32 个空闲周期指数退避，被同伴 worker 交接唤醒时清零。生产者看到有搜索者就不发 futex。
 - **每个 worker 一个定时器堆**：任务把截止时间加在当前 worker 的堆上，加定时器互不争锁；条目记住所在的堆，迁移后照样能取消。每个堆的大小和最早截止时间有原子镜像，另有一个“非空堆”位图，计时线程和各 worker 的周期检查只看非空、且确有到期的堆。计时线程扫描前公布“正在扫描”标记、扫描后公布自己的截止时间；加定时器的一方先写镜像再读这个值（全部 seq_cst），截止时间更早就唤醒它，不会漏。
 - **计时角色不悬空**：只要还有挂起的定时器和空闲 worker，就必须有人持有计时角色；worker 带着角色空缺去跑任务前会叫醒一个空闲同伴接手，唤醒空闲 worker 时也优先绕开正在守定时器的那个。
@@ -326,7 +334,8 @@ Tokio 的 `yield_now` 会把任务推迟到本轮之后，语义不同。
 |---|---|---|
 | 无任务 / 1 万个 parked 任务 | 0% | — |
 | 1 个任务循环 `sleepFor(1ms)` | 0.6%（每次 1 个线程唤醒） | 0.5–1.1% |
-| 100 任务 × `sleepFor(10ms)` | 7.9% | — |
+| 100 任务 × `sleepFor(10ms)` | 3.2–3.9% | — |
+| 1000 任务 × `sleepFor(100ms)` | 7.7–8.2% | — |
 | 外部线程每 1 ms spawn 一个空任务 | 0.6–1.6% | 0.65–1.0% |
 | 外部线程每 10 µs spawn 一个空任务 | 16% | 12–14% |
 
