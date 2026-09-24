@@ -3,6 +3,7 @@
 #include <stackfull/coro/detail/ContextBlock.h>
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 
 namespace stackfull {
@@ -43,6 +44,9 @@ struct Task : coro::detail::ContextBlock {
     std::uint32_t slot = 0;
     std::uint32_t generation = 0;
 
+    // Bottom of the stack when SchedulerOptions::checkStackCanary is set.
+    std::uint64_t *stackCanary = nullptr;
+
     TaskState parkStateNow(std::memory_order const order = std::memory_order_acquire) const noexcept {
         return static_cast<TaskState>(parkState.load(order));
     }
@@ -51,6 +55,11 @@ struct Task : coro::detail::ContextBlock {
 inline std::uint8_t raw(TaskState const state) noexcept {
     return static_cast<std::uint8_t>(state);
 }
+
+// A cache line of this pattern sits at the bottom of each stack when
+// SchedulerOptions::checkStackCanary is set.
+constexpr std::uint64_t kStackCanary = 0x5AFE57AC6CA11A57ull;
+constexpr std::size_t kStackCanaryWords = 8;
 
 } // namespace detail
 } // namespace sched

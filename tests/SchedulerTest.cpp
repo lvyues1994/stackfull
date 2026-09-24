@@ -1,11 +1,14 @@
 #include <stackfull/sched/Scheduler.h>
 #include <stackfull/sched/ThisTask.h>
+#include <stackfull/stack/MmapStackAllocator.h>
+#include <stackfull/stack/PooledStackAllocator.h>
 
 #include <gtest/gtest.h>
 
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -13,12 +16,15 @@
 #include <thread>
 #include <vector>
 
+#include <sys/mman.h>
+
 #if STACKFULL_HAS_EXCEPTIONS
 #include <exception>
 #include <stdexcept>
 #endif
 
 using namespace stackfull::sched;
+namespace stack = stackfull::stack;
 
 namespace {
 
@@ -434,6 +440,109 @@ TEST(Scheduler, SpawnLimitIsExactWhileWorkersCacheSlots) {
     release.store(true);
     scheduler->stop(); // wakes the parked children once; they see `release`
     ASSERT_TRUE(waitIdle(*scheduler));
+}
+
+namespace {
+
+struct CountingStackAllocator final : stack::StackAllocator {
+    stack::StackAllocation allocate(std::size_t const size) noexcept override {
+        allocations.fetch_add(1);
+        return upstream->allocate(size);
+    }
+    void deallocate(stack::StackView const &view) noexcept override { upstream->deallocate(view); }
+
+    std::unique_ptr<stack::StackAllocator> upstream = stack::makeMmapStackAllocator();
+    std::atomic<int> allocations{0};
+};
+
+// Stacks with writable memory below them: an overflow corrupts memory
+// silently, as it would without a guard page.
+struct UnguardedStackAllocator final : stack::StackAllocator {
+    static constexpr std::size_t kSlack = 256 * 1024;
+    stack::StackAllocation allocate(std::size_t const size) noexcept override {
+        void *const mapping = ::mmap(nullptr, size + kSlack, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (mapping == MAP_FAILED) {
+            return stack::StackAllocation{stack::StackView{}, std::make_error_code(std::errc::not_enough_memory)};
+        }
+        return stack::StackAllocation{stack::StackView{static_cast<char *>(mapping) + kSlack, size}, std::error_code{}};
+    }
+    void deallocate(stack::StackView const &view) noexcept override {
+        ::munmap(static_cast<char *>(view.base) - kSlack, view.size + kSlack);
+    }
+};
+
+} // namespace
+
+TEST(Scheduler, ReservedStacksServeABurstOfSpawns) {
+    CountingStackAllocator upstream;
+    auto const pooled = stack::makePooledStackAllocator(upstream);
+    SchedulerOptions options = withWorkers(4);
+    options.allocator = pooled.get();
+    options.taskStackSize = 32 * 1024;
+    options.reserveStacks = 500;
+    auto scheduler = makeScheduler(options);
+    EXPECT_EQ(upstream.allocations.load(), 500);
+    std::atomic<int> parked{0};
+    std::atomic<bool> release{false};
+    for (int i = 0; i < 500; ++i) {
+        ASSERT_TRUE(scheduler->spawn([&] {
+            parked.fetch_add(1);
+            while (not release.load()) {
+                this_task::park();
+            }
+        }));
+    }
+    while (parked.load() < 500) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+    EXPECT_EQ(upstream.allocations.load(), 500); // the burst mapped nothing
+    release.store(true);
+    scheduler->stop();
+    ASSERT_TRUE(waitIdle(*scheduler));
+}
+
+TEST(Scheduler, StackCanaryStaysQuietForWellBehavedTasks) {
+    SchedulerOptions options = withWorkers(2);
+    options.checkStackCanary = true;
+    auto scheduler = makeScheduler(options);
+    std::atomic<int> done{0};
+    for (int i = 0; i < 200; ++i) {
+        ASSERT_TRUE(scheduler->spawn([&] {
+            for (int k = 0; k < 10; ++k) {
+                this_task::yield();
+            }
+            done.fetch_add(1);
+        }));
+    }
+    ASSERT_TRUE(waitIdle(*scheduler));
+    EXPECT_EQ(done.load(), 200);
+}
+
+TEST(SchedulerDeath, StackCanaryCatchesAnOverflowWithoutGuardPage) {
+    struct Deep {
+        // Fills each frame, as a real overflow (a used local buffer, deep
+        // recursion) writes its memory.
+        static int recurse(int const n, int const limit) {
+            char pad[512];
+            std::memset(pad, n, sizeof pad);
+            asm volatile("" : : "r"(pad) : "memory");
+            return n >= limit ? pad[0] : recurse(n + 1, limit) + pad[1];
+        }
+    };
+    EXPECT_DEATH_IF_SUPPORTED(
+        {
+            UnguardedStackAllocator allocator;
+            SchedulerOptions options = withWorkers(1);
+            options.allocator = &allocator;
+            options.taskStackSize = 32 * 1024;
+            options.checkStackCanary = true;
+            auto scheduler = makeScheduler(options);
+            scheduler->spawn([] { Deep::recurse(0, 128); }); // ~70 KiB deep on a 32 KiB stack
+            for (int i = 0; i < 2000; ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds{1});
+            }
+        },
+        "stack overflow");
 }
 
 TEST(Scheduler, SpawnFailsBeyondMaxTasks) {

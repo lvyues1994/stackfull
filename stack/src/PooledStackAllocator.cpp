@@ -34,6 +34,18 @@ struct SizeClass {
 // upstream allocator for the extra sizes.
 constexpr std::size_t kMaxSizeClasses = 8;
 
+// Reserved stacks move to a thread cache this many at a time.
+constexpr std::size_t kReserveBatch = 32;
+
+// Third tier: stacks set aside by reserve(), per size, behind a mutex. Only
+// touched when a thread's cache and the shared pool both miss.
+struct ReserveClass {
+    std::size_t size = 0;
+    FreeNode *head = nullptr;
+    std::size_t count = 0;
+    std::size_t target = 0; // released stacks refill up to this
+};
+
 // Shared tier: lock-free MPMC of whole stacks, any size class mixed. A
 // consumer that pops a stack of the wrong size hands it back to its own
 // thread cache (or upstream) and tries again a bounded number of times.
@@ -94,6 +106,12 @@ struct PooledStackAllocatorImpl final : StackAllocator {
         while (shared.pop(leftover) == queue::PopStatus::Ok) {
             upstream.deallocate(leftover);
         }
+        std::lock_guard<std::mutex> const reserveLock(reserveMutex);
+        for (ReserveClass &reserveClass : reserves) {
+            while (reserveClass.head != nullptr) {
+                upstream.deallocate(popReserve(reserveClass));
+            }
+        }
     }
 
     StackAllocation allocate(std::size_t const size) noexcept override {
@@ -109,7 +127,44 @@ struct PooledStackAllocatorImpl final : StackAllocator {
         if (takeFromShared(rounded, fromShared, cache)) {
             return StackAllocation{fromShared, std::error_code{}};
         }
+        StackView fromReserve;
+        if (takeFromReserve(rounded, fromReserve, cache)) {
+            return StackAllocation{fromReserve, std::error_code{}};
+        }
         return upstream.allocate(rounded);
+    }
+
+    std::size_t reserve(std::size_t const size, std::size_t const count) noexcept override {
+        std::size_t const rounded = roundUpToPage(size);
+        std::size_t missing = 0;
+        {
+            std::lock_guard<std::mutex> const lock(reserveMutex);
+            ReserveClass *const reserveClass = findOrAddReserve(rounded);
+            if (reserveClass == nullptr) {
+                return 0;
+            }
+            reserveClass->target = std::max(reserveClass->target, count);
+            missing = reserveClass->target > reserveClass->count ? reserveClass->target - reserveClass->count : 0;
+        }
+        constexpr std::size_t kChunk = 256;
+        StackView batch[kChunk];
+        while (missing != 0) {
+            std::size_t const wanted = std::min(missing, kChunk);
+            std::size_t const got = upstream.allocateMany(rounded, batch, wanted);
+            {
+                std::lock_guard<std::mutex> const lock(reserveMutex);
+                ReserveClass &reserveClass = *findOrAddReserve(rounded);
+                for (std::size_t i = 0; i < got; ++i) {
+                    pushReserve(reserveClass, batch[i]);
+                }
+            }
+            missing -= got;
+            if (got < wanted) {
+                break; // upstream ran out
+            }
+        }
+        std::lock_guard<std::mutex> const lock(reserveMutex);
+        return findOrAddReserve(rounded)->count;
     }
 
     void deallocate(StackView const &stack) noexcept override {
@@ -124,9 +179,7 @@ struct PooledStackAllocatorImpl final : StackAllocator {
                 return;
             }
         }
-        if (not giveToShared(stack)) {
-            upstream.deallocate(stack);
-        }
+        release(stack);
     }
 
 private:
@@ -221,6 +274,78 @@ private:
         return false;
     }
 
+    // A stack no thread cache takes: shared pool, then the reserve if it is
+    // below its target, then upstream.
+    void release(StackView const &stack) noexcept {
+        if (not giveToShared(stack) and not giveToReserve(stack)) {
+            upstream.deallocate(stack);
+        }
+    }
+
+    ReserveClass *findOrAddReserve(std::size_t const size) noexcept {
+        for (ReserveClass &reserveClass : reserves) {
+            if (reserveClass.size == size) {
+                return &reserveClass;
+            }
+        }
+        for (ReserveClass &reserveClass : reserves) {
+            if (reserveClass.size == 0) {
+                reserveClass.size = size;
+                return &reserveClass;
+            }
+        }
+        return nullptr;
+    }
+
+    static void pushReserve(ReserveClass &reserveClass, StackView const &stack) noexcept {
+        FreeNode *const node = nodeOf(stack);
+        node->next = reserveClass.head;
+        reserveClass.head = node;
+        reserveClass.count += 1;
+    }
+
+    static StackView popReserve(ReserveClass &reserveClass) noexcept {
+        FreeNode *const node = reserveClass.head;
+        reserveClass.head = node->next;
+        reserveClass.count -= 1;
+        return viewOf(node, reserveClass.size);
+    }
+
+    // One stack for the caller, and a batch more into its thread cache so the
+    // next allocations skip the mutex.
+    bool takeFromReserve(std::size_t const size, StackView &out, ThreadCache *const cache) noexcept {
+        std::lock_guard<std::mutex> const lock(reserveMutex);
+        ReserveClass *const reserveClass = findOrAddReserve(size);
+        if (reserveClass == nullptr or reserveClass->head == nullptr) {
+            return false;
+        }
+        out = popReserve(*reserveClass);
+        if (cache != nullptr) {
+            SizeClass *const sizeClass = findOrAddClass(*cache, size);
+            StackView const probe{nullptr, size};
+            for (std::size_t i = 1; i < kReserveBatch and reserveClass->head != nullptr and sizeClass != nullptr and
+                                    canCache(*cache, probe);
+                 ++i) {
+                pushFront(*cache, *sizeClass, popReserve(*reserveClass));
+            }
+        }
+        return true;
+    }
+
+    bool giveToReserve(StackView const &stack) noexcept {
+        std::lock_guard<std::mutex> const lock(reserveMutex);
+        for (ReserveClass &reserveClass : reserves) {
+            if (reserveClass.size == stack.size) {
+                if (reserveClass.count >= reserveClass.target) {
+                    return false;
+                }
+                pushReserve(reserveClass, stack);
+                return true;
+            }
+        }
+        return false;
+    }
+
     void drainToUpstream(ThreadCache &cache) noexcept {
         for (SizeClass &sizeClass : cache.classes) {
             while (sizeClass.head != nullptr) {
@@ -274,6 +399,8 @@ private:
     std::mutex registryMutex;
     std::vector<ThreadCache *> registry;
     SharedPool shared;
+    std::mutex reserveMutex;
+    ReserveClass reserves[kMaxSizeClasses];
 };
 
 } // namespace

@@ -4,6 +4,10 @@ set(STACKFULL_SCHED_QUEUE "BWOS" CACHE STRING
     "Per-worker run queue: BWOS (block-based work stealing) | RING (Go-style reference)")
 set_property(CACHE STACKFULL_SCHED_QUEUE PROPERTY STRINGS BWOS RING)
 
+set(STACKFULL_SCHED_TASK_CAPACITY "126976" CACHE STRING
+    "Most tasks one scheduler can keep alive (the ceiling for SchedulerOptions::maxTasks). \
+Sizes the injection and free-slot queues: about 12 bytes per task of capacity per scheduler.")
+
 add_library(stackfull_sched STATIC
     include/stackfull/sched/SchedulerOptions.h
     include/stackfull/sched/Scheduler.h
@@ -33,6 +37,16 @@ add_library(stackfull_sched STATIC
 add_library(stackfull::sched ALIAS stackfull_sched)
 
 target_include_directories(stackfull_sched PUBLIC include)
+
+# Queue capacity is (blocks - 1) * 4096 with a power-of-two block count.
+set(_stackfull_blocks 2)
+math(EXPR _stackfull_capacity "(${_stackfull_blocks} - 1) * 4096")
+while(_stackfull_capacity LESS STACKFULL_SCHED_TASK_CAPACITY)
+    math(EXPR _stackfull_blocks "${_stackfull_blocks} * 2")
+    math(EXPR _stackfull_capacity "(${_stackfull_blocks} - 1) * 4096")
+endwhile()
+# Changes the SchedulerCore layout: consumers must see it too.
+target_compile_definitions(stackfull_sched PUBLIC STACKFULL_SCHED_QUEUE_BLOCKS=${_stackfull_blocks})
 
 if(STACKFULL_SCHED_QUEUE STREQUAL "RING")
     # Changes the Worker layout: consumers must see it too.

@@ -8,7 +8,10 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <fstream>
+#include <string>
 #include <thread>
+#include <vector>
 
 using namespace stackfull::stack;
 
@@ -171,6 +174,79 @@ TEST(PooledStackAllocator, ProducerConsumerThreadsRecycleThroughTheSharedTier) {
     consumer.join();
     // Far fewer than one mmap per round: the shared tier recycled them.
     EXPECT_LT(upstream.allocations.load(), kRounds / 4);
+}
+
+namespace {
+
+long mappingCount() {
+    std::ifstream maps("/proc/self/maps");
+    std::string line;
+    long count = 0;
+    while (std::getline(maps, line)) {
+        ++count;
+    }
+    return count;
+}
+
+} // namespace
+
+TEST(MmapStackAllocator, AllocateManyCarvesUsableStacksFromOneMapping) {
+    MmapStackOptions options;
+    options.guardPages = 0;
+    auto const allocator = makeMmapStackAllocator(options);
+    constexpr std::size_t kCount = 16;
+    constexpr std::size_t kSize = 64 * 1024;
+    StackView stacks[kCount];
+    long const before = mappingCount();
+    ASSERT_EQ(allocator->allocateMany(kSize, stacks, kCount), kCount);
+#if defined(__linux__)
+    // One mapping for the batch (sanitizer runtimes add a few of their own);
+    // guarded stacks would add two per stack.
+    EXPECT_LT(mappingCount() - before, static_cast<long>(kCount) / 2);
+#else
+    static_cast<void>(before);
+#endif
+    for (std::size_t i = 0; i < kCount; ++i) {
+        EXPECT_EQ(stacks[i].size, kSize);
+        EXPECT_EQ(reinterpret_cast<std::uintptr_t>(stacks[i].base) % pageSize(), 0u);
+        std::memset(stacks[i].base, static_cast<int>(i), kSize);
+    }
+    for (std::size_t i = 0; i < kCount; ++i) {
+        EXPECT_EQ(static_cast<unsigned char const *>(stacks[i].base)[kSize - 1], i); // no overlap
+        allocator->deallocate(stacks[i]);
+    }
+}
+
+TEST(MmapStackAllocatorDeath, AllocateManyKeepsAGuardBelowEachStack) {
+    auto const allocator = makeMmapStackAllocator();
+    StackView stacks[4];
+    ASSERT_EQ(allocator->allocateMany(16 * 1024, stacks, 4), 4u);
+    auto *const belowBase = static_cast<volatile char *>(stacks[2].base) - 1;
+    EXPECT_DEATH_IF_SUPPORTED({ *belowBase = 1; }, "");
+    for (StackView const &stack : stacks) {
+        allocator->deallocate(stack);
+    }
+}
+
+TEST(PooledStackAllocator, ReserveServesLaterAllocationsWithoutUpstream) {
+    CountingAllocator upstream;
+    {
+        auto const pooled = makePooledStackAllocator(upstream);
+        EXPECT_EQ(pooled->reserve(16 * 1024, 100), 100u);
+        EXPECT_EQ(upstream.allocations.load(), 100);
+        std::vector<StackView> taken;
+        for (int i = 0; i < 100; ++i) {
+            StackAllocation const allocation = pooled->allocate(16 * 1024);
+            ASSERT_TRUE(allocation);
+            taken.push_back(allocation.stack);
+        }
+        EXPECT_EQ(upstream.allocations.load(), 100); // every one came from the reserve
+        for (StackView const &stack : taken) {
+            pooled->deallocate(stack);
+        }
+        EXPECT_EQ(upstream.deallocations.load(), 0); // thread cache, shared pool, reserve
+    }
+    EXPECT_EQ(upstream.allocations.load(), upstream.deallocations.load());
 }
 
 TEST(PooledStackAllocator, DestructionDrainsEveryThreadCache) {

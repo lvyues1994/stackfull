@@ -82,6 +82,12 @@ TaskCreation createTask(SchedulerCore &core, F &&body, TaskOptions const &option
     task->slot = slot;
     task->generation = core.slots[slot].generation.load(std::memory_order_acquire);
     task->join = join;
+    if (core.options.checkStackCanary) {
+        task->stackCanary = static_cast<std::uint64_t *>(allocation.stack.base);
+        for (std::size_t i = 0; i < kStackCanaryWords; ++i) {
+            task->stackCanary[i] = kStackCanary;
+        }
+    }
 #if STACKFULL_HAS_ASAN
     task->asanBottom = allocation.stack.base;
     task->asanSize = allocation.stack.size;

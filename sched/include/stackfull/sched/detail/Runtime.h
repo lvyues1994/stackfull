@@ -198,9 +198,27 @@ inline void SchedulerCore::wake(Task &task) noexcept {
 // Post-switch hooks
 // ---------------------------------------------------------------------------
 
+// Runs on the arriving side after `task` switched out, so its saved stack
+// pointer (fctx) is current: below the canary line means it is deeper than
+// its stack right now; a damaged canary means it was at some point.
+STACKFULL_ALWAYS_INLINE void checkStackCanary(Task const &task) noexcept {
+    if (task.stackCanary == nullptr) {
+        return;
+    }
+    std::uint64_t damage = 0;
+    for (std::size_t i = 0; i < kStackCanaryWords; ++i) {
+        damage |= task.stackCanary[i] ^ kStackCanary;
+    }
+    auto const lowest = reinterpret_cast<std::uintptr_t>(task.stackCanary + kStackCanaryWords);
+    if (damage != 0 or reinterpret_cast<std::uintptr_t>(task.fctx) < lowest) {
+        coro::fatal("stackfull: task stack overflow (it ran past the canary at the bottom of its stack)");
+    }
+}
+
 inline void onTaskYielded(coro::detail::ContextBlock &suspended, void *const arg) noexcept {
     Worker &worker = *static_cast<Worker *>(arg);
     Task &task = static_cast<Task &>(suspended);
+    checkStackCanary(task);
     // A pinned task may only wait in its worker's unstealable inbox.
     if (task.pinnedTo != nullptr) {
         task.pinnedTo->pinnedInbox.push(task);
@@ -212,6 +230,7 @@ inline void onTaskYielded(coro::detail::ContextBlock &suspended, void *const arg
 inline void onTaskParked(coro::detail::ContextBlock &suspended, void *const arg) noexcept {
     Worker &worker = *static_cast<Worker *>(arg);
     Task &task = static_cast<Task &>(suspended);
+    checkStackCanary(task);
     std::uint8_t state = raw(TaskState::Running);
     if (task.parkState.compare_exchange_strong(state, raw(TaskState::Parked), std::memory_order_acq_rel,
                                                std::memory_order_acquire)) {
@@ -226,6 +245,7 @@ inline void onTaskParked(coro::detail::ContextBlock &suspended, void *const arg)
 
 inline void onTaskFinished(coro::detail::ContextBlock &finished, void *const arg) noexcept {
     Worker &worker = *static_cast<Worker *>(arg);
+    checkStackCanary(static_cast<Task &>(finished));
     worker.core.releaseTask(static_cast<Task &>(finished));
 }
 

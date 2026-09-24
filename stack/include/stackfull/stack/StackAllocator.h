@@ -43,6 +43,29 @@ struct StackAllocator {
     virtual StackAllocation allocate(std::size_t size) noexcept = 0;
 
     virtual void deallocate(StackView const &stack) noexcept = 0;
+
+    // Allocates up to `count` stacks of `size` into `out`; returns how many.
+    // Implementations may batch the system calls.
+    virtual std::size_t allocateMany(std::size_t const size, StackView *const out, std::size_t const count) noexcept {
+        std::size_t done = 0;
+        for (; done < count; ++done) {
+            StackAllocation const allocation = allocate(size);
+            if (not allocation) {
+                break;
+            }
+            out[done] = allocation.stack;
+        }
+        return done;
+    }
+
+    // Sets aside `count` stacks of `size` so that later allocations of that
+    // size need no system call (a startup prewarm); returns how many are now
+    // held for that size. The default holds none.
+    virtual std::size_t reserve(std::size_t const size, std::size_t const count) noexcept {
+        static_cast<void>(size);
+        static_cast<void>(count);
+        return 0;
+    }
 };
 
 } // namespace stack

@@ -73,6 +73,34 @@ struct MmapStackAllocatorImpl final : StackAllocator {
         return StackAllocation{view, std::error_code{}};
     }
 
+    // One mapping carved into [guard | stack] slots; each stack is later
+    // unmapped on its own, which munmap allows for any page range.
+    std::size_t allocateMany(std::size_t const size, StackView *const out, std::size_t const count) noexcept override {
+        std::size_t const usable = roundUpToPage(size, page);
+        std::size_t const guard = options.guardPages * page;
+        if (count == 0 or usable == 0 or usable > std::numeric_limits<std::size_t>::max() - guard) {
+            return 0;
+        }
+        std::size_t const slot = usable + guard;
+        if (slot > std::numeric_limits<std::size_t>::max() / count) {
+            return 0;
+        }
+        void *const mapping = ::mmap(nullptr, slot * count, PROT_READ | PROT_WRITE, mmapFlags(options), -1, 0);
+        if (mapping == MAP_FAILED) {
+            return 0;
+        }
+        std::size_t done = 0;
+        for (; done < count; ++done) {
+            char *const start = static_cast<char *>(mapping) + done * slot;
+            if (guard != 0 and ::mprotect(start, guard, PROT_NONE) != 0) {
+                ::munmap(start, (count - done) * slot);
+                break;
+            }
+            out[done] = StackView{start + guard, usable};
+        }
+        return done;
+    }
+
     void deallocate(StackView const &stack) noexcept override {
         if (isEmpty(stack)) {
             return;

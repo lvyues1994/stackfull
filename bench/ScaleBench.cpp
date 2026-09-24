@@ -7,6 +7,8 @@
 #include <stackfull/sched/Scheduler.h>
 #include <stackfull/sched/ThisTask.h>
 #include <stackfull/sched/WakeToken.h>
+#include <stackfull/stack/MmapStackAllocator.h>
+#include <stackfull/stack/PooledStackAllocator.h>
 
 #include <algorithm>
 #include <atomic>
@@ -209,10 +211,34 @@ long mappingCount() {
     return count;
 }
 
-// `count` parked tasks: spawn cost from a cold stack pool, resident memory and
-// memory mappings per task.
-void footprint(int const count, std::size_t const stackSize) {
-    auto scheduler = schedulerWith(4, stackSize, 126976);
+enum class Stacks { Guarded, Unguarded, UnguardedWithCanary };
+
+// `count` parked tasks: spawn cost, resident memory and memory mappings per
+// task. Guarded: the default cold pool. Unguarded: stacks without guard pages,
+// reserved (batch-mapped) before the clock starts; with a canary, each task
+// also touches its stack's bottom page.
+void footprint(int const count, std::size_t const stackSize, Stacks const stacks = Stacks::Guarded) {
+    bool const prepared = stacks != Stacks::Guarded;
+    std::unique_ptr<stackfull::stack::StackAllocator> upstream;
+    std::unique_ptr<stackfull::stack::StackAllocator> pooled;
+    SchedulerOptions options;
+    options.workers = 4;
+    options.taskStackSize = stackSize;
+    options.maxTasks = 126976;
+    long const mapsAtStart = mappingCount();
+    long const rssAtStart = statusKiB("VmRSS:");
+    auto const reserveStart = Clock::now();
+    if (prepared) {
+        stackfull::stack::MmapStackOptions unguarded;
+        unguarded.guardPages = 0;
+        upstream = stackfull::stack::makeMmapStackAllocator(unguarded);
+        pooled = stackfull::stack::makePooledStackAllocator(*upstream);
+        options.allocator = pooled.get();
+        options.reserveStacks = static_cast<std::size_t>(count);
+        options.checkStackCanary = stacks == Stacks::UnguardedWithCanary;
+    }
+    auto scheduler = makeScheduler(options);
+    double const reserveSeconds = std::chrono::duration<double>(Clock::now() - reserveStart).count();
     std::this_thread::sleep_for(kWarmup);
     long const rssBefore = statusKiB("VmRSS:");
     long const mapsBefore = mappingCount();
@@ -236,11 +262,19 @@ void footprint(int const count, std::size_t const stackSize) {
         std::this_thread::sleep_for(milliseconds{1});
     }
     double const per = static_cast<double>(spawned);
-    std::printf("footprint    %6d tasks x %3zu KiB stack: spawned %d, %.0f ns/spawn, RSS +%.1f KiB/task, "
+    std::printf("footprint    %6d tasks x %3zu KiB stack%s: spawned %d, %.0f ns/spawn, RSS +%.1f KiB/task, "
                 "mappings +%.2f/task\n",
-                count, stackSize / 1024, spawned, 1e9 * spawnSeconds / per,
-                static_cast<double>(statusKiB("VmRSS:") - rssBefore) / per,
-                static_cast<double>(mappingCount() - mapsBefore) / per);
+                count, stackSize / 1024,
+                stacks == Stacks::Guarded     ? ""
+                : stacks == Stacks::Unguarded ? " (unguarded, reserved)"
+                                              : " (unguarded, reserved, canary)",
+                spawned, 1e9 * spawnSeconds / per,
+                static_cast<double>(statusKiB("VmRSS:") - (prepared ? rssAtStart : rssBefore)) / per,
+                static_cast<double>(mappingCount() - (prepared ? mapsAtStart : mapsBefore)) / per);
+    if (prepared) {
+        std::printf("             reserving them took %.1f ms (%.0f ns/stack)\n", 1e3 * reserveSeconds,
+                    1e9 * reserveSeconds / per);
+    }
     release.store(true);
     scheduler->stop();
     waitIdle(*scheduler);
@@ -383,6 +417,8 @@ int main(int const argc, char **const argv) {
         footprint(100000, 64 * 1024);
         footprint(10000, 128 * 1024);
         footprint(100000, 16 * 1024);
+        footprint(100000, 16 * 1024, Stacks::Unguarded);
+        footprint(100000, 16 * 1024, Stacks::UnguardedWithCanary);
     }
     if (what == "all" or what == "lat") {
         condvarLatency(microseconds{1000}, 3000);

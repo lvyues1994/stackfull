@@ -32,9 +32,13 @@ using LocalQueue = queue::BwosQueue<Task *, 8, 32>;
 #endif
 
 // Global MPMC queue: external spawns/wakes, placement onto idle workers, and
-// local-queue overflow. Also reused for the free list of slab indices.
-using InjectionQueue = queue::BbqQueue<Task *, 32, 4096>;
-using SlotQueue = queue::BbqQueue<std::uint32_t, 32, 4096>;
+// local-queue overflow. Also reused for the free list of slab indices. Their
+// capacity bounds maxTasks; set at build time (STACKFULL_SCHED_TASK_CAPACITY).
+#ifndef STACKFULL_SCHED_QUEUE_BLOCKS
+#define STACKFULL_SCHED_QUEUE_BLOCKS 32
+#endif
+using InjectionQueue = queue::BbqQueue<Task *, STACKFULL_SCHED_QUEUE_BLOCKS, 4096>;
+using SlotQueue = queue::BbqQueue<std::uint32_t, STACKFULL_SCHED_QUEUE_BLOCKS, 4096>;
 
 constexpr std::size_t kMaxWorkers = 64;
 

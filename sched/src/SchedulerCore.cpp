@@ -104,6 +104,9 @@ SchedulerCore::SchedulerCore(SchedulerOptions const &options_) : options(options
     STACKFULL_CHECK(options.maxTasks >= 1 and options.maxTasks <= SlotQueue::kCapacity,
                     "stackfull: SchedulerOptions::maxTasks out of range for the injection queue");
     allocator = options.allocator != nullptr ? options.allocator : &stack::defaultStackAllocator();
+    if (options.reserveStacks != 0) {
+        allocator->reserve(options.taskStackSize, options.reserveStacks);
+    }
     driver = options.driver;
 #if STACKFULL_HAS_EXCEPTIONS
     exceptionSink = options.exceptionSink != nullptr ? options.exceptionSink : &abortingExceptionSink();

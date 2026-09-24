@@ -21,6 +21,11 @@ struct MmapStackOptions {
 // One mmap per stack, guard page via mprotect. Sizes are rounded up to the
 // system page size. Thread-safe; every call is a system call, so pair it with
 // makePooledStackAllocator for high create/destroy rates.
+//
+// allocateMany() maps a whole batch at once. Each guard page is a separate
+// memory mapping (VMA) as far as the kernel is concerned, so every guarded
+// stack costs two; with guardPages = 0 a batch is a single mapping, which
+// matters where vm.max_map_count is low (65530 on stock Android kernels).
 std::unique_ptr<StackAllocator> makeMmapStackAllocator(MmapStackOptions const &options = MmapStackOptions{});
 
 // Runtime page size (sysconf). Cached after the first call.

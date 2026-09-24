@@ -185,6 +185,37 @@ switch (select(control, frames)) { case 0: ...; case 1: ...; }
 - `Completion` 可拷贝、`set()`/`fail()` 首次生效、`get()` 单消费者移出结果；`Completion<void>` 接受并忽略任何回调参数。`Stream` 单消费者，`close()` 后 `next()` 排空再返回 false；`Mailbox` 无界（丢控制事件比增长更糟）。
 - 任务里等回调不占 worker：`get()`/`next()` park 后 worker 去跑别的任务，回调线程只做一次 `wake()`。
 
+## 海量任务
+
+```cpp
+stack::MmapStackOptions unguarded;
+unguarded.guardPages = 0;                                  // 一批栈 = 一个映射，不再受 vm.max_map_count 限制
+auto upstream = stack::makeMmapStackAllocator(unguarded);
+auto pooled = stack::makePooledStackAllocator(*upstream);  // 两者都要活得比调度器久
+
+SchedulerOptions options;
+options.allocator = pooled.get();
+options.taskStackSize = 16 * 1024;
+options.maxTasks = 100000;
+options.reserveStacks = 100000;    // 构造时批量映射并预留：突发 spawn 不再 mmap
+options.checkStackCanary = true;   // 可选：无保护页时的溢出检测
+auto scheduler = makeScheduler(options);
+```
+
+- `StackAllocator::allocateMany` 一次映射切出多个栈；`reserve(size, count)` 预留，池化分配器把它们放在第三层（批量转入线程缓存），预留数同时是下限：别的层都满时回收的栈先补回这里再还给系统。
+- `checkStackCanary` 在栈底写一条缓存行的哨兵，任务每次切出时检查哨兵和保存的栈指针，越界即以 "stack overflow" 终止。代价是每个任务多碰栈底那一页（RSS +4 KiB）。
+- 单个调度器的任务上限由构建选项 `STACKFULL_SCHED_TASK_CAPACITY` 决定（默认 126976，每单位容量约 12 字节）；`maxTasks` 不能超过它。
+
+10 万个任务、16 KiB 栈（x86_64，`stackfull_scale_bench mem`）：
+
+| 栈 | spawn | 每任务 RSS | 每任务映射 |
+|---|---|---|---|
+| 默认（保护页，冷池） | 2.6 µs | 3.9 KiB | 1.96 |
+| 无保护页 + 预留 | 0.48 µs | 4.0 KiB | 0 |
+| 无保护页 + 预留 + 哨兵 | 1.1 µs | 8.0 KiB | 0 |
+
+预留本身约 0.85 µs/栈，发生在构造调度器时。
+
 ## 定时器与 IO
 
 ```cpp
@@ -328,7 +359,7 @@ IO 与定时器：
 - 协程可能在线程间迁移，**不要跨 `yield()` 持有 `thread_local` 变量地址、`errno`、`pthread_self()`/`std::this_thread::get_id()` 的结果**：glibc 把 `pthread_self` 和 `__errno_location` 标记为 `const`，优化器会把它们跨 yield 合并。
 - 协程内的 `catch (...)` 必须 `throw;` 重抛，否则会吞掉 `ForcedUnwind`。
 - `yield()` 只能在协程内调用；对 Running / Done 的协程 `resume()`、协程析构自己，都会 `abort()` 并给出原因。
-- 每个带 guard page 的栈占 2 个 VMA，Linux 默认 `vm.max_map_count = 65530`，海量协程需要无 guard 的大 slab 分配器（`StackAllocator` 留有接口）。
+- 每个带 guard page 的栈占 2 个 VMA，Linux/Android 默认 `vm.max_map_count = 65530`，即约 3.2 万个任务。更多任务见下文“海量任务”：无保护页栈批量映射只占一个 VMA，代价是溢出不再立刻段错误（用 `checkStackCanary` 兜底）。
 
 ## 平台备注
 

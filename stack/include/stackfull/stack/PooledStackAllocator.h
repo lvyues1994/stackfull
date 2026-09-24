@@ -27,6 +27,11 @@ struct PooledStackOptions {
 // ran it, so without it every spawn on a producer thread would fall through
 // to mmap.
 //
+// reserve() adds a third tier: stacks set aside ahead of time (allocated
+// from upstream in batches), handed to thread caches a batch at a time. The
+// reserved count is also a floor: stacks released while the other tiers
+// are full refill it before going back upstream.
+//
 // `upstream` is borrowed and must outlive the returned allocator. The pooled
 // allocator itself must outlive every thread that used it; destroying it
 // drains all caches back to `upstream`.

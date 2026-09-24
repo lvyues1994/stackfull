@@ -28,11 +28,19 @@ struct ExceptionSink {
 struct SchedulerOptions {
     // 0 selects std::thread::hardware_concurrency(). At most 64.
     std::size_t workers = 0;
-    // Upper bound on simultaneously live tasks; sizes the injection queue and
-    // the wake-token slab. spawn() fails with resource_unavailable_try_again
-    // beyond it.
+    // Upper bound on simultaneously live tasks; sizes the wake-token slab.
+    // spawn() fails with resource_unavailable_try_again beyond it. At most
+    // the build's STACKFULL_SCHED_TASK_CAPACITY (126976 by default).
     std::size_t maxTasks = 65536;
     std::size_t taskStackSize = std::size_t{128} * 1024;
+    // Stacks of taskStackSize the allocator sets aside at construction
+    // (StackAllocator::reserve): a burst of spawns then maps no memory.
+    std::size_t reserveStacks = 0;
+    // Write a canary at the bottom of every task stack and check it each
+    // time a task switches out; a clobbered canary aborts with "stack
+    // overflow". Meant for allocators without guard pages
+    // (MmapStackOptions::guardPages = 0), where an overflow is otherwise silent.
+    bool checkStackCanary = false;
     // Borrowed; nullptr selects stack::defaultStackAllocator().
     stack::StackAllocator *allocator = nullptr;
     // Borrowed event source (the IO layer's Poller). nullptr: idle workers
