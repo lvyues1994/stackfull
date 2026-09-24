@@ -3,6 +3,7 @@
 #include <stackfull/io/Poller.h>
 #include <stackfull/io/Registration.h>
 #include <stackfull/io/Tcp.h>
+#include <stackfull/io/TcpStream.h>
 #include <stackfull/sched/Scheduler.h>
 #include <stackfull/sched/Sleep.h>
 #include <stackfull/sched/ThisTask.h>
@@ -376,6 +377,161 @@ TEST_P(IoTest, ReadinessAfterTheWaiterIsGoneIsHarmless) {
     std::this_thread::sleep_for(milliseconds{30}); // delivered to a waker whose task is gone
     char buffer[4];
     EXPECT_EQ(::read(readEnd.get(), buffer, sizeof buffer), 1); // nobody consumed it
+}
+
+TEST_P(IoTest, TcpStreamEchoesBufferedWrites) {
+    TcpListenerResult bound = TcpListener::bind(*poller, SocketAddress::loopback(0));
+    ASSERT_TRUE(bound) << bound.error.message();
+    TcpListener &listener = *bound.listener;
+    WaitGroup done;
+    done.add(2);
+    std::string expected;
+    for (int i = 0; i < 1000; ++i) {
+        expected += "msg-" + std::to_string(i) + "\n";
+    }
+    std::string echoed;
+    ASSERT_TRUE(scheduler->spawn([&] {
+        TcpStreamResult peer = listener.accept();
+        EXPECT_TRUE(peer);
+        if (peer) {
+            char buffer[512];
+            for (;;) {
+                IoResult const got = peer.stream->read(buffer, sizeof buffer);
+                if (not got or got.bytes == 0) {
+                    break;
+                }
+                peer.stream->writeAll(buffer, got.bytes);
+            }
+        }
+        done.done(); // dropping the stream closes it: the client sees EOF
+    }));
+    ASSERT_TRUE(scheduler->spawn([&] {
+        TcpStreamResult client = TcpStream::connect(*poller, SocketAddress::loopback(listener.port()));
+        EXPECT_TRUE(client) << client.error.message();
+        if (client) {
+            BufWriter out(*client.stream, 256);
+            for (int i = 0; i < 1000; ++i) {
+                std::string const line = "msg-" + std::to_string(i) + "\n";
+                EXPECT_TRUE(out.write(line.data(), line.size()));
+            }
+            EXPECT_TRUE(out.flush());
+            EXPECT_FALSE(client.stream->shutdownWrite());
+            char buffer[512];
+            for (;;) {
+                IoResult const got = client.stream->read(buffer, sizeof buffer);
+                if (not got or got.bytes == 0) {
+                    break;
+                }
+                echoed.append(buffer, got.bytes);
+            }
+        }
+        done.done();
+    }));
+    done.wait();
+    EXPECT_EQ(echoed, expected);
+}
+
+TEST_P(IoTest, ReadForTimesOutOnAnIdleConnection) {
+    TcpListenerResult bound = TcpListener::bind(*poller, SocketAddress::loopback(0));
+    ASSERT_TRUE(bound);
+    TcpListener &listener = *bound.listener;
+    WaitGroup done;
+    done.add(2);
+    std::error_code firstRead;
+    milliseconds waited{0};
+    std::string later;
+    std::atomic<bool> timedOut{false};
+    ASSERT_TRUE(scheduler->spawn([&] {
+        TcpStreamResult peer = listener.accept();
+        EXPECT_TRUE(peer);
+        while (not timedOut.load()) {
+            this_task::sleepFor(milliseconds{1});
+        }
+        if (peer) {
+            peer.stream->writeAll("late", 4);
+        }
+        done.done();
+    }));
+    ASSERT_TRUE(scheduler->spawn([&] {
+        TcpStreamResult client = TcpStream::connect(*poller, SocketAddress::loopback(listener.port()));
+        EXPECT_TRUE(client);
+        if (client) {
+            char buffer[8];
+            auto const start = std::chrono::steady_clock::now();
+            firstRead = client.stream->readFor(milliseconds{20}, buffer, sizeof buffer).error;
+            waited = std::chrono::duration_cast<milliseconds>(std::chrono::steady_clock::now() - start);
+            timedOut.store(true);
+            IoResult const got = client.stream->readExactly(buffer, 4); // a timeout leaves the stream usable
+            later.assign(buffer, got.bytes);
+        }
+        done.done();
+    }));
+    done.wait();
+    EXPECT_EQ(firstRead, std::errc::timed_out);
+    EXPECT_GE(waited.count(), 20);
+    EXPECT_EQ(later, "late");
+}
+
+TEST_P(IoTest, AcceptForTimesOut) {
+    TcpListenerResult bound = TcpListener::bind(*poller, SocketAddress::loopback(0));
+    ASSERT_TRUE(bound);
+    WaitGroup done;
+    done.add(1);
+    std::error_code error;
+    ASSERT_TRUE(scheduler->spawn([&] {
+        error = bound.listener->acceptFor(milliseconds{15}).error;
+        done.done();
+    }));
+    done.wait();
+    EXPECT_EQ(error, std::errc::timed_out);
+}
+
+TEST_P(IoTest, WritevAllSendsEveryVector) {
+    TcpListenerResult bound = TcpListener::bind(*poller, SocketAddress::loopback(0));
+    ASSERT_TRUE(bound);
+    TcpListener &listener = *bound.listener;
+    constexpr std::size_t kChunk = 512 * 1024;
+    std::vector<std::string> chunks = {std::string(kChunk, 'a'), std::string(kChunk, 'b'), std::string(kChunk, 'c')};
+    WaitGroup done;
+    done.add(2);
+    std::size_t received = 0;
+    bool inOrder = true;
+    ASSERT_TRUE(scheduler->spawn([&] {
+        TcpStreamResult peer = listener.accept();
+        EXPECT_TRUE(peer);
+        if (peer) {
+            char buffer[64 * 1024];
+            for (;;) {
+                IoResult const got = peer.stream->read(buffer, sizeof buffer);
+                if (not got or got.bytes == 0) {
+                    break;
+                }
+                for (std::size_t i = 0; i < got.bytes; ++i) {
+                    inOrder = inOrder and buffer[i] == "abc"[(received + i) / kChunk];
+                }
+                received += got.bytes;
+                this_task::yield(); // a slow reader: the writer sees short writes
+            }
+        }
+        done.done();
+    }));
+    ASSERT_TRUE(scheduler->spawn([&] {
+        TcpStreamResult client = TcpStream::connect(*poller, SocketAddress::loopback(listener.port()));
+        EXPECT_TRUE(client);
+        if (client) {
+            iovec vectors[3];
+            for (std::size_t i = 0; i < 3; ++i) {
+                vectors[i] = iovec{&chunks[i][0], kChunk};
+            }
+            IoResult const sent = client.stream->writevAll(vectors, 3);
+            EXPECT_TRUE(sent);
+            EXPECT_EQ(sent.bytes, 3 * kChunk);
+        }
+        done.done();
+    }));
+    done.wait();
+    EXPECT_EQ(received, 3 * kChunk);
+    EXPECT_TRUE(inOrder);
 }
 
 #if defined(__linux__)

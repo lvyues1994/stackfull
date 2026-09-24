@@ -188,43 +188,40 @@ switch (select(control, frames)) { case 0: ...; case 1: ...; }
 ## 定时器与 IO
 
 ```cpp
-#include <stackfull/io/Poller.h>
-#include <stackfull/io/Registration.h>
-#include <stackfull/io/Async.h>
-#include <stackfull/io/Tcp.h>
+#include <stackfull/runtime/Runtime.h>
+#include <stackfull/io/TcpStream.h>
 #include <stackfull/sched/Sleep.h>
+using namespace stackfull;
 
-auto poller = io::makeDefaultPoller();        // Linux/Android: epoll；其他：poll
-SchedulerOptions options;
-options.driver = poller.get();                // 空闲 worker 睡在 epoll_wait 里而不是 futex
-auto scheduler = makeScheduler(options);
+int main() {
+    blockOn([] {                                   // 默认调度器的空闲 worker 睡在 defaultPoller() 里
+        this_task::sleepFor(std::chrono::milliseconds{10});   // 任务挂起，worker 空出来
 
-scheduler->spawn([&] {
-    this_task::sleepFor(std::chrono::milliseconds{10});   // 任务挂起，worker 空出来
-
-    auto listener = io::listenTcpLoopback();
-    io::Registration acceptor(*poller, listener.fd.get());
-    for (;;) {
-        io::AcceptResult client = io::accept(acceptor);    // EAGAIN → park 到就绪
-        int const fd = client.fd.release();
-        scheduler->spawn([fd, &poller] {
-            io::Fd connection{fd};
-            io::Registration registration(*poller, connection.get());   // 先注册、后关闭（析构顺序）
-            char buffer[4096];
-            for (;;) {
-                io::IoResult const got = io::read(registration, buffer, sizeof buffer);
-                if (not got or got.bytes == 0) return;
-                io::writeAll(registration, buffer, got.bytes);
-            }
-        });
-    }
-});
+        auto bound = io::TcpListener::bind(defaultPoller(), io::SocketAddress::any(8080));
+        if (not bound) return;
+        for (;;) {
+            io::TcpStreamResult peer = bound.listener->accept();   // EAGAIN → park 到就绪
+            if (not peer) continue;
+            go([conn = std::shared_ptr<io::TcpStream>(std::move(peer.stream))] {
+                char buffer[4096];
+                for (;;) {
+                    io::IoResult got = conn->readFor(std::chrono::seconds{30}, buffer, sizeof buffer);
+                    if (not got or got.bytes == 0) return;            // 出错、超时或对端关闭
+                    conn->writeAll(buffer, got.bytes);
+                }
+            });
+        }
+    });
+}
 ```
 
-- **timekeeper**：任一时刻只有一个空闲 worker 以最早的定时器为超时睡在 `Driver::wait()`（有 Driver 时即 `epoll_wait`）里，并负责触发到期定时器；其他空闲 worker 睡自己的 futex。新定时器若成为最早的会打断 timekeeper 重算超时。忙碌的 worker 每 61 次分派做一次维护：触发定时器并对 Driver 做一次非阻塞轮询，所以全忙时 IO 也不会饿死。
-- 就绪是**一次性**的：每次 `waitReadable/Writable` 重新 arm，没人等的 fd 零开销。事件携带 fd 号而非指针，分派时在锁下查表，`Registration` 析构后的迟到事件只会查不到，不会解引用。
-- `Registration` 的等待者和 `sync` 原语一样是栈上侵入式节点，任务与普通线程都能用；`io::read/write/accept/connect` 在 `EAGAIN` 时挂起调用者。
-- `Scheduler::stop()` 的 `ForcedUnwind` 会穿过所有阻塞点：每个 park 点都有摘链守卫（`WaitGuard` / 定时器 `cancel` / `Registration::detach`），并处理"通知方刚摘走、尚未写完 `satisfied`"的窗口。任何包含 `park()` 的函数都不能是 `noexcept`。
+- `TcpStream` / `TcpListener` 拥有 fd 和它的 `Registration`，析构时先从 Poller 摘除、再关闭 fd；`Poller` 显式传入——它必须是某个运行中的调度器在轮询的那个。自建调度器时 `options.driver = poller.get()`，再把同一个 poller 传给 IO 对象；默认调度器用 `defaultPoller()`。
+- 带超时的版本：`readFor/readUntil`、`acceptFor/acceptUntil`、`TcpStream::connect(poller, addr, deadline)`、`writeAllUntil`，超时返回 `std::errc::timed_out`，流仍可继续使用。`writevAll` 做聚集写；`BufWriter` 把小写入攒起来，一次 `writev` 连同放不下的负载一起发出。
+- 底层接口仍在：`io::Registration` + `io::read/write/accept/connect/readv/writev`，用于自定义 fd。
+- **epoll 边沿触发**：fd 在 `add` 时一次注册读写两个方向，等待不调用 `epoll_ctl`；echo 往返的成功路径零 `epoll_ctl`。就绪按方向计数：操作在系统调用**之前**取计数快照，`EAGAIN` 后等待比快照新的报告，系统调用与等待之间到达的边沿不会丢。`poll` 后端（QNX）仍是一次性 arm，同一套计数协议成立。
+- **timekeeper**：任一时刻只有一个空闲 worker 以最早的定时器为超时睡在 `Driver::wait()`（有 Driver 时即 `epoll_wait`）里，并负责触发到期定时器；其他空闲 worker 睡自己的 futex。忙碌的 worker 每 61 次分派做一次维护：触发到期定时器并对 Driver 做一次非阻塞轮询，所以全忙时 IO 也不会饿死。
+- 分派在表锁下一趟收集整批事件的等待者、解锁后再唤醒；事件携带 fd 号而非指针，`Registration` 析构后的迟到事件只会查不到。等待者按值记为 `Waker`，从不指向等待方的栈。
+- `Scheduler::stop()` 的 `ForcedUnwind` 会穿过所有阻塞点，每个 park 点都有摘除守卫。任何包含 `park()` 的函数都不能是 `noexcept`。
 
 ## 构建
 
@@ -269,7 +266,7 @@ gcc 13 -O3；Android 列为小米 25091RP04C（arm64，Android 16）上 NDK r28 
 | `Channel<long>` 容量 64，1P/1C，2 workers | 15 ns | 51 ns |
 | `Channel<long>` 容量 1，1P/1C，2 workers | 90 ns | 268 ns |
 | TCP loopback echo 往返（1 字节，epoll，2 workers） | 4.0–5.4 µs | 未复测 |
-| TCP loopback echo 往返（1 字节，epoll，1 worker） | 4.0–4.6 µs | 未复测 |
+| TCP loopback echo 往返（1 字节，epoll，1 worker） | 3.7–4.2 µs | 未复测 |
 | TCP loopback echo 往返（poll 后端，2 workers） | 4.7–5.6 µs | 未复测 |
 | 100 任务并发 `sleepFor(200µs)`，每个定时器分摊 | 2.6 µs | 2.8 µs |
 

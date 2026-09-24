@@ -1,6 +1,7 @@
 // Bridging callback-style SDKs into tasks: Completion, Stream, Mailbox,
 // select, and the runtime entry points (go / async / blockOn).
 
+#include <stackfull/io/TcpStream.h>
 #include <stackfull/runtime/Runtime.h>
 #include <stackfull/sched/Scheduler.h>
 #include <stackfull/sched/Sleep.h>
@@ -504,6 +505,34 @@ TEST(Runtime, GoAsyncBlockOn) {
     EXPECT_EQ(answer, 42);
     EXPECT_EQ(&defaultScheduler(), &defaultScheduler());
     EXPECT_TRUE(go([] {}));
+}
+
+TEST(Runtime, DefaultSchedulerDoesIoThroughDefaultPoller) {
+    std::string const reply = blockOn([] {
+        io::TcpListenerResult bound = io::TcpListener::bind(defaultPoller(), io::SocketAddress::loopback(0));
+        if (not bound) {
+            return std::string("bind: ") + bound.error.message();
+        }
+        io::TcpListener &listener = *bound.listener;
+        auto const served = async([&listener] {
+            io::TcpStreamResult peer = listener.accept();
+            char buffer[4];
+            if (peer and peer.stream->readExactly(buffer, 4).bytes == 4) {
+                peer.stream->writeAll("pong", 4);
+            }
+        });
+        io::TcpStreamResult client =
+            io::TcpStream::connect(defaultPoller(), io::SocketAddress::loopback(listener.port()));
+        if (not client) {
+            return std::string("connect: ") + client.error.message();
+        }
+        client.stream->writeAll("ping", 4);
+        char buffer[4];
+        io::IoResult const got = client.stream->readExactly(buffer, 4);
+        served.get();
+        return std::string(buffer, got.bytes);
+    });
+    EXPECT_EQ(reply, "pong");
 }
 
 TEST(Runtime, BlockOnVoid) {

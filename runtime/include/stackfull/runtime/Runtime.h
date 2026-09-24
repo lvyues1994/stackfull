@@ -2,6 +2,7 @@
 
 #include <stackfull/coro/Config.h>
 #include <stackfull/coro/ForcedUnwind.h>
+#include <stackfull/io/Poller.h>
 #include <stackfull/sched/Scheduler.h>
 #include <stackfull/sync/Completion.h>
 
@@ -19,8 +20,14 @@
 namespace stackfull {
 
 // Lazily created on first use with hardware_concurrency() workers, already
-// running, never destroyed.
+// running, never destroyed. Its idle workers sleep in defaultPoller(), so
+// tasks on it can do IO.
 sched::Scheduler &defaultScheduler();
+
+// The Poller that defaultScheduler() polls (created together with it). Pass
+// it to io::TcpStream / io::TcpListener / io::Registration used from tasks
+// on the default scheduler, or from plain threads.
+io::Poller &defaultPoller();
 
 // Fire-and-forget on the default scheduler.
 template <class F>
