@@ -18,6 +18,7 @@ add_library(stackfull_sched STATIC
     include/stackfull/sched/Driver.h
     include/stackfull/sched/Sleep.h
     include/stackfull/sched/Affinity.h
+    include/stackfull/sched/Stats.h
     include/stackfull/sched/detail/Task.h
     include/stackfull/sched/detail/MpscQueue.h
     include/stackfull/sched/detail/SchedulerCore.h

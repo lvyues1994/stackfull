@@ -149,6 +149,7 @@ Task *Worker::steal() noexcept {
         if (local.minRemainingSlots() < LocalQueue::kEntriesPerBlock) {
             // Little room here: take a single task.
             if (victim.local.steal(first)) {
+                bump(steals);
                 return first;
             }
             continue;
@@ -158,6 +159,7 @@ Task *Worker::steal() noexcept {
         if (stolen == 0) {
             continue;
         }
+        bump(steals);
         std::size_t const pushed = local.pushBatch(batch + 1, batch + stolen);
         for (std::size_t j = 1 + pushed; j < stolen; ++j) {
             core.inject(*batch[j]); // cannot happen after the room check; kept total
@@ -359,6 +361,7 @@ Task *Worker::placeGathered(bool const keepFirst) noexcept {
 // it runs one itself instead of waking a peer for it; the others sleep on
 // their Parker until notified.
 void Worker::sleepIdle() noexcept {
+    bump(sleeps);
     bool const stopping = core.stopping.load(std::memory_order_acquire);
     if (not core.tryBecomeTimekeeper(*this)) {
         if (stopping) {

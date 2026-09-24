@@ -2,11 +2,13 @@
 
 #include <stackfull/sched/JoinHandle.h>
 #include <stackfull/sched/SchedulerOptions.h>
+#include <stackfull/sched/Stats.h>
 #include <stackfull/sched/detail/JoinState.h>
 #include <stackfull/sched/detail/Runtime.h>
 #include <stackfull/sched/detail/TaskFactory.h>
 
 #include <cstddef>
+#include <functional>
 #include <memory>
 #include <system_error>
 #include <utility>
@@ -75,6 +77,14 @@ struct Scheduler {
     virtual std::size_t workerCount() const noexcept = 0;
     // Tasks created and not yet finished.
     virtual std::size_t liveTasks() const noexcept = 0;
+
+    // Counters (and, if enabled, the wake-latency histogram), summed over
+    // workers. Thread-safe; a snapshot taken while the scheduler runs.
+    virtual SchedulerStats stats() const = 0;
+    // Calls `visit` once for every live task, e.g. to dump what is parked.
+    // Each TaskInfo is a copy taken at that moment; the task may have moved
+    // on by the time `visit` sees it. Thread-safe.
+    virtual void forEachTask(std::function<void(TaskInfo const &)> const &visit) const = 0;
 
 protected:
     virtual detail::SchedulerCore &core() noexcept = 0;

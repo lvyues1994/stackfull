@@ -80,11 +80,17 @@ struct SchedulerOptions {
     // instead of waking one after another. The first helper for a batch is
     // always woken at once. 0 restores immediate ramp-up.
     std::chrono::microseconds rampUpDelay{50};
+    // Fill SchedulerStats::wakeLatency: a clock read when a task becomes
+    // runnable and when it runs again.
+    bool recordWakeLatency = false;
 };
 
 struct TaskOptions {
     // 0 selects SchedulerOptions::taskStackSize.
     std::size_t stackSize = 0;
+    // Shown by Scheduler::forEachTask(). Not copied: must outlive the task
+    // (a string literal, typically).
+    char const *name = nullptr;
 };
 
 struct SpawnResult {

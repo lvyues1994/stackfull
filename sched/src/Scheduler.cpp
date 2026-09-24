@@ -79,12 +79,73 @@ struct SchedulerImpl final : Scheduler {
     }
 
     std::size_t workerCount() const noexcept override { return core_.workers.size(); }
+
+    SchedulerStats stats() const override {
+        SchedulerStats result;
+        result.liveTasks = core_.liveTasks();
+        result.tasksSpawned = core_.foreignCreated.load(std::memory_order_relaxed);
+        result.tasksFinished = core_.foreignFinished.load(std::memory_order_relaxed);
+        result.timersFired = core_.timersFired.load(std::memory_order_relaxed);
+        for (auto const &owned : core_.workers) {
+            detail::Worker const &worker = *owned;
+            WorkerStats stats;
+            stats.tasksSpawned = worker.tasksCreated.load(std::memory_order_relaxed);
+            stats.tasksFinished = worker.tasksFinished.load(std::memory_order_relaxed);
+            stats.sleeps = worker.sleeps.load(std::memory_order_relaxed);
+            stats.steals = worker.steals.load(std::memory_order_relaxed);
+            stats.yields = worker.yieldTick.load(std::memory_order_relaxed);
+            result.tasksSpawned += stats.tasksSpawned;
+            result.tasksFinished += stats.tasksFinished;
+            for (std::size_t i = 0; i < kWakeLatencyBuckets; ++i) {
+                result.wakeLatency[i] += worker.wakeLatency[i].load(std::memory_order_relaxed);
+            }
+            result.workers.push_back(stats);
+        }
+        return result;
+    }
+
+    // Slots are pinned like WakeToken::wake() does, so a task is not freed
+    // while we read it; empty slots are skipped without pinning.
+    void forEachTask(std::function<void(TaskInfo const &)> const &visit) const override {
+        for (std::uint32_t i = 0; i < core_.options.maxTasks; ++i) {
+            detail::TaskSlot &entry = core_.slots[i];
+            if (entry.task.load(std::memory_order_acquire) == nullptr) {
+                continue;
+            }
+            entry.pins.fetch_add(1, std::memory_order_acq_rel);
+            detail::Task const *const task = entry.task.load(std::memory_order_acquire);
+            TaskInfo info;
+            if (task != nullptr) {
+                info.slot = i;
+                info.name = task->name;
+                info.status = statusOf(task->parkState.load(std::memory_order_acquire));
+            }
+            entry.pins.fetch_sub(1, std::memory_order_release);
+            if (task != nullptr) {
+                visit(info);
+            }
+        }
+    }
     std::size_t liveTasks() const noexcept override { return core_.liveTasks(); }
 
 protected:
     detail::SchedulerCore &core() noexcept override { return core_; }
 
 private:
+    static TaskStatus statusOf(std::uint8_t const state) noexcept {
+        switch (static_cast<detail::TaskState>(state)) {
+        case detail::TaskState::Running:
+            return TaskStatus::Runnable;
+        case detail::TaskState::Parked:
+            return TaskStatus::Parked;
+        case detail::TaskState::Notified:
+            return TaskStatus::Waking;
+        case detail::TaskState::Done:
+            break;
+        }
+        return TaskStatus::Finishing;
+    }
+
     // Starts background threads for workers [first, N) not yet launched.
     void launchFrom(std::size_t const first) {
         std::lock_guard<std::mutex> const lock(lifecycle);

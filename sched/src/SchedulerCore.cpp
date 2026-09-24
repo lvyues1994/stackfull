@@ -296,11 +296,15 @@ void SchedulerCore::fireTimers() noexcept {
         return;
     }
     TimePoint const now = std::chrono::steady_clock::now();
+    std::uint64_t fired = 0;
     for (; mask != 0; mask &= mask - 1) {
         TimerQueue &queue = workers[static_cast<std::size_t>(__builtin_ctzll(mask))]->timers;
         if (queue.earliestTicks() <= ticksOf(now)) {
-            queue.fireExpired(now);
+            fired += queue.fireExpired(now);
         }
+    }
+    if (fired != 0) {
+        timersFired.fetch_add(fired, std::memory_order_relaxed);
     }
 }
 

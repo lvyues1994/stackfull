@@ -52,6 +52,7 @@ void taskEntry(fcontext::transfer_t const transfer) {
     coro::detail::ContextBlock &previous = *static_cast<coro::detail::ContextBlock *>(transfer.data);
     Task &self = static_cast<Task &>(*previous.thread->current);
     coro::detail::onArrival(self, transfer);
+    recordWakeLatency(self, *static_cast<Worker *>(self.thread->worker));
 
     runTaskBody(self);
 

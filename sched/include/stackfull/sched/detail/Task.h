@@ -46,6 +46,10 @@ struct Task : coro::detail::ContextBlock {
 
     // Bottom of the stack when SchedulerOptions::checkStackCanary is set.
     std::uint64_t *stackCanary = nullptr;
+    char const *name = nullptr; // TaskOptions::name
+    // When it was last made runnable (steady_clock ticks), with
+    // SchedulerOptions::recordWakeLatency; 0 otherwise.
+    std::int64_t readyAt = 0;
 
     TaskState parkStateNow(std::memory_order const order = std::memory_order_acquire) const noexcept {
         return static_cast<TaskState>(parkState.load(order));

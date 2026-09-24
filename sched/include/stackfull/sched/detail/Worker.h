@@ -3,6 +3,7 @@
 #include <stackfull/coro/detail/ContextBlock.h>
 #include <stackfull/coro/detail/ThreadState.h>
 #include <stackfull/sched/Parker.h>
+#include <stackfull/sched/Stats.h>
 #include <stackfull/sched/detail/MpscQueue.h>
 #include <stackfull/sched/detail/SchedulerCore.h>
 #include <stackfull/sched/detail/Task.h>
@@ -119,6 +120,10 @@ struct Worker {
     // SchedulerCore::liveTasks().
     std::atomic<std::uint64_t> tasksCreated{0};
     std::atomic<std::uint64_t> tasksFinished{0};
+    // SchedulerStats counters, single writer.
+    std::atomic<std::uint64_t> sleeps{0};
+    std::atomic<std::uint64_t> steals{0};
+    std::atomic<std::uint64_t> wakeLatency[kWakeLatencyBuckets] = {};
 
     // Deadlines added by tasks while running here; fired by any worker.
     alignas(64) TimerQueue timers;

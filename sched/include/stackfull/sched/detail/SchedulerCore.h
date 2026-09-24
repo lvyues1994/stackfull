@@ -148,6 +148,7 @@ struct SchedulerCore {
     std::atomic<Worker *> timekeeper{nullptr};
     // Bit per worker whose timer queue is non-empty.
     std::atomic<std::uint64_t> timerMask{0};
+    std::atomic<std::uint64_t> timersFired{0};
     // When the timekeeper will wake at the latest (kNoDeadline: only when
     // woken), or kScanningTimers while it looks for the earliest deadline.
     std::atomic<std::int64_t> keeperDeadline{kNoDeadline};

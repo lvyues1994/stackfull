@@ -652,6 +652,113 @@ TEST(Scheduler, StallMonitorIgnoresTasksThatYield) {
     EXPECT_EQ(sink.count(), 0u);
 }
 
+TEST(Scheduler, StatsCountSpawnsFinishesSleepsAndYields) {
+    auto scheduler = makeScheduler(withWorkers(2));
+    for (int i = 0; i < 100; ++i) {
+        ASSERT_TRUE(scheduler->spawn([] {
+            this_task::yield();
+            this_task::yield();
+        }));
+    }
+    ASSERT_TRUE(waitIdle(*scheduler));
+    std::this_thread::sleep_for(std::chrono::milliseconds{10}); // the workers go back to sleep
+    SchedulerStats const stats = scheduler->stats();
+    EXPECT_EQ(stats.liveTasks, 0u);
+    EXPECT_EQ(stats.tasksSpawned, 100u);
+    EXPECT_EQ(stats.tasksFinished, 100u);
+    ASSERT_EQ(stats.workers.size(), 2u);
+    std::uint64_t sleeps = 0;
+    std::uint64_t yields = 0;
+    std::uint64_t finished = 0;
+    for (WorkerStats const &worker : stats.workers) {
+        sleeps += worker.sleeps;
+        yields += worker.yields;
+        finished += worker.tasksFinished;
+    }
+    EXPECT_GE(sleeps, 1u);
+    EXPECT_EQ(yields, 200u);
+    EXPECT_EQ(finished, 100u); // every task finishes on some worker
+    std::uint64_t latencies = 0;
+    for (std::uint64_t const count : stats.wakeLatency) {
+        latencies += count;
+    }
+    EXPECT_EQ(latencies, 0u); // not enabled
+}
+
+TEST(Scheduler, WakeLatencyIsRecordedWhenEnabled) {
+    SchedulerOptions options = withWorkers(2);
+    options.recordWakeLatency = true;
+    auto scheduler = makeScheduler(options);
+    std::atomic<bool> haveToken{false};
+    WakeToken token{};
+    std::atomic<int> resumed{0};
+    ASSERT_TRUE(scheduler->spawn([&] {
+        token = this_task::token();
+        haveToken.store(true);
+        while (resumed.load() < 50) {
+            this_task::park();
+            resumed.fetch_add(1);
+        }
+    }));
+    while (not haveToken.load()) {
+        std::this_thread::yield();
+    }
+    for (int i = 0; i < 50;) {
+        int const before = resumed.load();
+        token.wake();
+        while (resumed.load() == before) {
+            std::this_thread::yield();
+        }
+        i = resumed.load();
+    }
+    ASSERT_TRUE(waitIdle(*scheduler));
+    std::uint64_t latencies = 0;
+    for (std::uint64_t const count : scheduler->stats().wakeLatency) {
+        latencies += count;
+    }
+    // The first run always counts; a wake that lands before the task parks
+    // again is consumed without a switch and has no latency to record.
+    EXPECT_GE(latencies, 1u);
+    EXPECT_LE(latencies, 51u);
+}
+
+TEST(Scheduler, ForEachTaskListsLiveTasksByName) {
+    auto scheduler = makeScheduler(withWorkers(2));
+    std::atomic<int> parked{0};
+    std::atomic<bool> release{false};
+    char const *const names[] = {"reader", "writer", "janitor"};
+    for (char const *const name : names) {
+        TaskOptions options;
+        options.name = name;
+        ASSERT_TRUE(scheduler->spawn(
+            [&] {
+                parked.fetch_add(1);
+                while (not release.load()) {
+                    this_task::park();
+                }
+            },
+            options));
+    }
+    while (parked.load() < 3) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds{5}); // parked for real
+    std::set<std::string> seen;
+    int parkedSeen = 0;
+    scheduler->forEachTask([&](TaskInfo const &info) {
+        seen.insert(info.name != nullptr ? info.name : "?");
+        parkedSeen += info.status == TaskStatus::Parked ? 1 : 0;
+    });
+    EXPECT_EQ(seen, (std::set<std::string>{"janitor", "reader", "writer"}));
+    EXPECT_EQ(parkedSeen, 3);
+    release.store(true);
+    scheduler->stop();
+    ASSERT_TRUE(waitIdle(*scheduler));
+    int after = 0;
+    scheduler->forEachTask([&](TaskInfo const &) { ++after; });
+    EXPECT_EQ(after, 0);
+}
+
 TEST(Scheduler, SpawnFailsBeyondMaxTasks) {
     SchedulerOptions options = deferredSingleWorker(); // tasks stay alive until start()
     options.maxTasks = 4;

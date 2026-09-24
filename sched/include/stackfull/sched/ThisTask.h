@@ -59,7 +59,8 @@ STACKFULL_ALWAYS_INLINE void park() {
         return; // consume the pending token without switching
     }
     task.postSwitch = coro::detail::PostSwitchHook{&detail::onTaskParked, &current.worker};
-    coro::detail::switchTo(task, current.worker.nextOrDispatcher());
+    coro::ThreadState &now = coro::detail::switchTo(task, current.worker.nextOrDispatcher());
+    detail::recordWakeLatency(task, *static_cast<detail::Worker *>(now.worker));
 }
 
 inline WakeToken token() noexcept {

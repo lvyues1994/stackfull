@@ -155,6 +155,9 @@ inline void SchedulerCore::pushInjection(Task &task) noexcept {
 // workers must be fed, not left to steal); a fully busy worker keeps it
 // local in the LIFO slot; a foreign thread always injects.
 inline void SchedulerCore::schedule(Task &task) noexcept {
+    if (options.recordWakeLatency) {
+        task.readyAt = ticksOf(std::chrono::steady_clock::now());
+    }
     if (task.pinnedTo != nullptr) {
         Worker &target = *task.pinnedTo;
         target.pinnedInbox.push(task);
@@ -201,6 +204,29 @@ inline void SchedulerCore::wake(Task &task) noexcept {
 // Runs on the arriving side after `task` switched out, so its saved stack
 // pointer (fctx) is current: below the canary line means it is deeper than
 // its stack right now; a damaged canary means it was at some point.
+// Owner-only counter: a relaxed load and store, i.e. a plain increment.
+STACKFULL_ALWAYS_INLINE void bump(std::atomic<std::uint64_t> &counter) noexcept {
+    counter.store(counter.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+}
+
+inline std::size_t wakeLatencyBucket(std::int64_t const nanos) noexcept {
+    std::uint64_t const micros = nanos > 0 ? static_cast<std::uint64_t>(nanos) / 1000 : 0;
+    if (micros < 2) {
+        return 0;
+    }
+    auto const log2 = static_cast<std::size_t>(63 - __builtin_clzll(micros));
+    return log2 < kWakeLatencyBuckets ? log2 : kWakeLatencyBuckets - 1;
+}
+
+// In the task's own context, right after it resumed on `worker`.
+STACKFULL_ALWAYS_INLINE void recordWakeLatency(Task &task, Worker &worker) noexcept {
+    if (task.readyAt != 0) {
+        std::int64_t const waited = ticksOf(std::chrono::steady_clock::now()) - task.readyAt;
+        task.readyAt = 0;
+        bump(worker.wakeLatency[wakeLatencyBucket(waited)]);
+    }
+}
+
 STACKFULL_ALWAYS_INLINE void countSwitch(Worker &worker) noexcept {
     worker.switchCount.store(worker.switchCount.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
 }

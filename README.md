@@ -101,6 +101,25 @@ int main() {
 - `rampUpDelay`（默认 50 µs）：找到活且还有剩余时，下一个空闲 worker 延迟这么久、并且积压仍在才加入；一批短任务由已醒的 worker 清掉，不再逐个唤醒。为计时角色叫醒同伴也按同一间隔节流。设 0 恢复立即扩容。
 - `blocking(fn)`：在任务里调用时，`fn` 在按需伸缩的阻塞线程池上执行（最多 64 个线程，空闲 10 秒退出），任务 park 等结果并接收其异常；普通线程里调用则就地执行。
 
+可观测性：
+
+```cpp
+SchedulerStats stats = scheduler->stats();     // 存活/已创建/已结束任务、已触发定时器，每个 worker 的睡眠/窃取/yield 次数
+for (std::size_t i = 0; i < kWakeLatencyBuckets; ++i) { /* stats.wakeLatency[i]：需 options.recordWakeLatency */ }
+
+TaskOptions named;
+named.name = "uplink-reader";                  // 字符串须比任务活得久（通常是字面量）
+scheduler->spawn(body, named);
+scheduler->forEachTask([](TaskInfo const &task) {   // 例如出问题时转储谁还挂着
+    std::printf("slot %u %s %s\n", task.slot, task.name ? task.name : "-",
+                task.status == TaskStatus::Parked ? "parked" : "runnable");
+});
+```
+
+- 计数器都是各 worker 单写者的 relaxed 计数，`stats()` 逐个读取求和，不在热路径上引入共享写。
+- 唤醒延迟直方图从任务变为可运行（spawn、被唤醒）到它再次运行，按 2 的幂分桶（微秒）；关闭时只多两个分支。
+- `forEachTask` 按 `WakeToken` 的 pin 协议读取槽位，回调拿到的是当时的拷贝。
+
 设计要点：
 
 - **本地队列 BWoS**（OSDI'23，自 Tokio 参考实现移植，`queue/PROVENANCE.md`）：owner 快路径块内 relaxed 原子、零屏障；窃取按块。全局注入队列 **BBQ**（ATC'22）无锁 MPMC，容量绑定 `maxTasks` 故永不满；slab 空闲索引同样用 BBQ。`-DSTACKFULL_SCHED_QUEUE=RING` 切换到 Go 风格环形队列做对照。
