@@ -14,7 +14,8 @@ namespace io {
 // One descriptor's membership in a Poller plus the (at most one per
 // direction) party waiting for it. Construct after the descriptor is
 // non-blocking; destroy before closing it. The registration must outlive
-// every wait on it.
+// every wait on it. Waiters are kept as Wakers by value, so readiness is
+// never delivered into a waiter's stack frame.
 //
 // waitReadable()/waitWritable() work from tasks (park) and from plain
 // threads (block), like the sync primitives.
@@ -40,7 +41,7 @@ struct Registration {
 
 private:
     std::error_code waitFor(Interest direction);
-    void detach(Interest direction, sync::detail::Waiter &waiter) noexcept;
+    void detach(Interest direction, sync::detail::Waker const &waker) noexcept;
 
     Poller &owner;
     int const descriptor;
@@ -48,8 +49,8 @@ private:
 
     std::atomic<std::uint8_t> ready{0};
     sync::SpinLock lock;
-    sync::detail::Waiter *readWaiter = nullptr;
-    sync::detail::Waiter *writeWaiter = nullptr;
+    sync::detail::Waker readWaker;
+    sync::detail::Waker writeWaker;
 };
 
 } // namespace io

@@ -36,89 +36,68 @@ std::error_code Registration::waitFor(Interest const direction) {
     if (addError) {
         return addError;
     }
+    std::uint8_t const bit = bits(direction);
+    sync::detail::Waiter waiter;
+    sync::detail::Waker const me = waiter.waker();
+    // Any way out, forced unwind included: take our waker back if deliver()
+    // has not already. Nothing ever points into this frame.
+    struct DetachOnExit {
+        Registration &self;
+        Interest direction;
+        sync::detail::Waker const &me;
+        ~DetachOnExit() { self.detach(direction, me); }
+    } detachOnExit{*this, direction, me};
     for (;;) {
         // Consume a report that already arrived.
-        std::uint8_t const pending = ready.load(std::memory_order_acquire);
-        if ((pending & bits(direction)) != 0) {
-            ready.fetch_and(static_cast<std::uint8_t>(~bits(direction)), std::memory_order_acq_rel);
+        if ((ready.load(std::memory_order_acquire) & bit) != 0) {
+            ready.fetch_and(static_cast<std::uint8_t>(~bit), std::memory_order_acq_rel);
             return std::error_code{};
         }
-
-        sync::detail::Waiter waiter;
         Interest armed = Interest::None;
         {
             sync::SpinLockGuard const guard(lock);
-            if (direction == Interest::Readable) {
-                readWaiter = &waiter;
-            } else {
-                writeWaiter = &waiter;
-            }
+            (direction == Interest::Readable ? readWaker : writeWaker) = me;
             // Arm for everything anyone currently waits on, so a concurrent
             // waiter in the other direction is not disarmed by our one-shot.
-            armed = (readWaiter != nullptr ? Interest::Readable : Interest::None) |
-                    (writeWaiter != nullptr ? Interest::Writable : Interest::None);
+            armed = (readWaker.isEmpty() ? Interest::None : Interest::Readable) |
+                    (writeWaker.isEmpty() ? Interest::None : Interest::Writable);
         }
-        std::error_code const error = owner.arm(*this, armed);
-        if (error) {
-            detach(direction, waiter);
+        if (std::error_code const error = owner.arm(*this, armed)) {
             return error;
         }
-        // Forced unwind while parked: take our pointer back out of the slot,
-        // or wait for a deliver() that already took it to finish with us.
-        struct DetachOnUnwind {
-            Registration &self;
-            Interest direction;
-            sync::detail::Waiter &waiter;
-            bool armed = true;
-            ~DetachOnUnwind() {
-                if (armed) {
-                    self.detach(direction, waiter);
-                }
-            }
-        } detachOnUnwind{*this, direction, waiter};
-        waiter.wait(); // deliver() unlinked us before notifying
-        detachOnUnwind.armed = false;
+        // deliver() sets the bit before waking and wakeups are sticky, so a
+        // report landing before we block is not lost.
+        while ((ready.load(std::memory_order_acquire) & bit) == 0) {
+            waiter.block();
+        }
     }
 }
 
-void Registration::detach(Interest const direction, sync::detail::Waiter &waiter) noexcept {
-    bool stillLinked = false;
-    {
-        sync::SpinLockGuard const guard(lock);
-        if (direction == Interest::Readable and readWaiter == &waiter) {
-            readWaiter = nullptr;
-            stillLinked = true;
-        } else if (direction == Interest::Writable and writeWaiter == &waiter) {
-            writeWaiter = nullptr;
-            stillLinked = true;
-        }
-    }
-    if (not stillLinked and not waiter.satisfied.load(std::memory_order_acquire)) {
-        waiter.awaitNotifier(); // deliver() has our pointer and will store `satisfied`
+void Registration::detach(Interest const direction, sync::detail::Waker const &waker) noexcept {
+    sync::SpinLockGuard const guard(lock);
+    sync::detail::Waker &slot = direction == Interest::Readable ? readWaker : writeWaker;
+    if (slot == waker) {
+        slot.clear();
     }
 }
 
 void Registration::deliver(Interest const readyNow) noexcept {
-    sync::detail::Waiter *reader = nullptr;
-    sync::detail::Waiter *writer = nullptr;
+    sync::detail::Waker reader;
+    sync::detail::Waker writer;
     {
         sync::SpinLockGuard const guard(lock);
         ready.fetch_or(bits(readyNow), std::memory_order_acq_rel);
         if (has(readyNow, Interest::Readable)) {
-            reader = readWaiter;
-            readWaiter = nullptr;
+            reader = readWaker;
+            readWaker.clear();
         }
         if (has(readyNow, Interest::Writable)) {
-            writer = writeWaiter;
-            writeWaiter = nullptr;
+            writer = writeWaker;
+            writeWaker.clear();
         }
     }
-    if (reader != nullptr) {
-        reader->notify();
-    }
-    if (writer != nullptr) {
-        writer->notify();
-    }
+    reader.wake();
+    writer.wake();
 }
 
 } // namespace io

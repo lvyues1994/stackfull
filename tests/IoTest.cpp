@@ -343,6 +343,41 @@ TEST_P(IoTest, WaitFromPlainThreadWorksToo) {
     EXPECT_EQ(result.bytes, 1u);
 }
 
+// The registration outlives the task waiting on it: stop() unwinds the task
+// (or, without exceptions, releases its stack outright) and readiness shows
+// up only afterwards. Delivering it must not touch the task's stack.
+TEST_P(IoTest, ReadinessAfterTheWaiterIsGoneIsHarmless) {
+    int ends[2] = {-1, -1};
+    ASSERT_EQ(::pipe(ends), 0);
+    Fd readEnd{ends[0]};
+    Fd writeEnd{ends[1]};
+    ASSERT_FALSE(setNonBlocking(readEnd.get()));
+    Registration registration(*poller, readEnd.get());
+    // The waiter runs on a scheduler of its own; the fixture's scheduler
+    // keeps polling and delivers the late readiness.
+    SchedulerOptions options;
+    options.workers = 1;
+    auto waiterScheduler = makeScheduler(options);
+    std::atomic<bool> waiting{false};
+    ASSERT_TRUE(waiterScheduler->spawn([&] {
+        waiting.store(true);
+        char buffer[4];
+        io::read(registration, buffer, sizeof buffer); // never completes
+    }));
+    while (not waiting.load()) {
+        std::this_thread::sleep_for(milliseconds{1});
+    }
+    std::this_thread::sleep_for(milliseconds{10});
+    waiterScheduler->stop();
+    while (waiterScheduler->liveTasks() != 0) {
+        std::this_thread::sleep_for(milliseconds{1});
+    }
+    ASSERT_EQ(::write(writeEnd.get(), "x", 1), 1);
+    std::this_thread::sleep_for(milliseconds{30}); // delivered to a waker whose task is gone
+    char buffer[4];
+    EXPECT_EQ(::read(readEnd.get(), buffer, sizeof buffer), 1); // nobody consumed it
+}
+
 #if defined(__linux__)
 INSTANTIATE_TEST_SUITE_P(Backends, IoTest, ::testing::Values(Backend::Epoll, Backend::Poll), backendName);
 #else
