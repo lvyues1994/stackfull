@@ -98,6 +98,7 @@ int main() {
 
 - `onWorkerStart(index)`：每个 worker 线程开始跑任务前调用，在这里绑核（`sched::pinCurrentThreadToCpus({4, 5, 6, 7})`，Linux/Android 用 `sched_setaffinity`，QNX 用 runmask）、设优先级或实时调度策略。worker 线程名为 `sf-worker-N`。
 - `stallThreshold` / `stallSink`：某个 worker 在一个任务上连续这么久没有 yield/park/结束，就报告一次（默认打印到 stderr）；由一个每半个阈值醒一次的监视线程完成，默认关闭。
+- `idleSpin`（默认 x86 5 µs，ARM 20 µs）：空闲 worker 睡前自旋找活的时长，0 关闭。
 - `rampUpDelay`（默认 50 µs）：找到活且还有剩余时，下一个空闲 worker 延迟这么久、并且积压仍在才加入；一批短任务由已醒的 worker 清掉，不再逐个唤醒。为计时角色叫醒同伴也按同一间隔节流。设 0 恢复立即扩容。
 - `blocking(fn)`：在任务里调用时，`fn` 在按需伸缩的阻塞线程池上执行（最多 64 个线程，空闲 10 秒退出），任务 park 等结果并接收其异常；普通线程里调用则就地执行。
 
@@ -126,7 +127,8 @@ scheduler->forEachTask([](TaskInfo const &task) {   // 例如出问题时转储�
 - **直接交接**：`yield/park/结束` 在任务栈上取下一个本地任务并一次切换过去；`PostSwitchHook` 在到达方执行重入队 / park 状态迁移 / 释放栈，保证任务寄存器保存完毕后才可能被别的线程恢复。
 - **park/wake 协议**：`Running → Parked → Notified → Running` 两侧各一次原子操作，无锁无自旋；wake 令牌粘滞，早到的 wake 让下一次 park 立即返回。park 一侧用 CAS `Running → Parked`，若已被唤醒（Notified）则直接回到 Running 并重排——Parked 哪怕短暂出现一瞬，第二个唤醒者也会再调度一次，任务被恢复两次（曾经的 bug，`ConcurrentWakesScheduleAParkingTaskOnce` 覆盖）。`WakeToken` 是 `(slot, generation)`，释放时等待 pin 计数归零，过期令牌安全。
 - **放置策略**：pinned → 所属 worker 收件箱；有空闲 worker → 注入队列 + unpark 一个（BWoS 偷不到短队列，空闲者要喂而不是让它偷）；全忙 → 本地 LIFO 槽（连续 3 次后让队列）；外部线程 → 注入队列。计时线程触发定时器或轮询 Driver 时把唤醒的任务收成一批：第一个自己跑，其余进注入队列只唤醒一个同伴；最后一个搜索者只在还有剩余工作时才请求下一个加入（经计时线程延迟 `rampUpDelay`，届时积压仍在才真正加入）。孤立事件因此只唤醒一个线程，一批短任务也不再逐个唤醒整个线程池。
-- **空闲自旋**：按时间限制（5 µs，而不是迭代次数——刚出深度空闲的核频率低，迭代预算会拖成几十微秒），同时最多 2 个 worker 自旋；连续落空后按 2、4…32 个空闲周期指数退避，被同伴 worker 交接唤醒时清零。生产者看到有搜索者就不发 futex。
+- **空闲自旋**：按时间限制（`idleSpin`，而不是迭代次数——刚出深度空闲的核频率低，迭代预算会拖成几十微秒），同时最多 2 个 worker 自旋；连续落空后按 2、4…32 个空闲周期指数退避，被同伴 worker 交接唤醒时清零。生产者看到有搜索者就不发 futex。ARM 默认 20 µs：手机上一次 futex 往返约 20 µs，5 µs 的自旋在每 10 µs 一个事件时总是差一点落空，自旋加 futex 两头付，占用反而从 131% 升到 174–200%；代价是事件间隔短于 20 µs 时 worker 一直在自旋（下表约 100%）。有 Driver 而无人在轮询它时不自旋，以免推迟发现 IO 就绪。
+- **`stop()` 先唤醒、后回收**：先把所有 parked 任务各唤醒一次，全部唤醒完成后 worker 才开始回收仍 parked 的任务。否则还没轮到的任务会在看到 `stopRequested()` 之前就被强制展开（手机上测出的 bug，`StopWakesEveryParkedTaskBeforeUnwindingAny` 覆盖）。
 - **每个 worker 一个定时器堆**：任务把截止时间加在当前 worker 的堆上，加定时器互不争锁；条目记住所在的堆，迁移后照样能取消。每个堆的大小和最早截止时间有原子镜像，另有一个“非空堆”位图，计时线程和各 worker 的周期检查只看非空、且确有到期的堆。计时线程扫描前公布“正在扫描”标记、扫描后公布自己的截止时间；加定时器的一方先写镜像再读这个值（全部 seq_cst），截止时间更早就唤醒它，不会漏。
 - **计时角色不悬空**：只要还有挂起的定时器和空闲 worker，就必须有人持有计时角色；worker 带着角色空缺去跑任务前会叫醒一个空闲同伴接手，唤醒空闲 worker 时也优先绕开正在守定时器的那个。
 - **栈池共享层**：任务栈通常由 spawn 方线程分配、由运行它的 worker 释放，纯线程本地池会退化成每任务一次 mmap；池化分配器增加了一层无锁共享池（BBQ）。
@@ -304,29 +306,29 @@ Android 设备上跑测试：`cmake --preset android-arm64 -DSTACKFULL_BUILD_TES
 
 ## 性能
 
-gcc 13 -O3；Android 列为小米 25091RP04C（arm64，Android 16）上 NDK r28 构建的实测。
+gcc 13 -O3；Android 列为小米 25091RP04C（arm64，8 核，Android 16）上 NDK r28 构建的实测，取 3 次中位数。手机上线程在核间迁移会让同一个用例的单次结果差 10–20%（单 worker channel 在 33 与 38 ns 两档之间跳，绑到单核后新旧版本都是 32.8 ns），跨 worker 用例在不同时段可差 1.5 倍；比较版本须同一时段交替运行，必要时 `taskset` 绑核。
 
 | 操作 | x86_64 | Android arm64 |
 |---|---|---|
 | 裸 fcontext jump（每次切换） | 2.8 ns | 12 ns |
 | `Coroutine::resume()` + `yield()`（每次切换） | 4.8 ns | 24 ns |
-| 协程创建 + 运行 + 销毁（池化栈） | 26 ns | 84 ns |
-| BWoS owner push+pop，无 thief | 2.6 ns | 9 ns |
-| BWoS owner push+pop，3 个 thief 持续窃取 | 5.5 ns | 74 ns |
-| Ring（Go 风格）owner push+pop，3 个 thief | 165 ns | 244 ns |
-| 调度器 `yield` 两任务直接交接（每次切换） | 15.8 ns | 42 ns |
-| 同 worker park/wake 交接 | 22.5 ns | 62 ns |
-| 跨 worker（pinned）park/wake 交接 | 60 ns | 99 ns |
-| spawn + 运行 + 释放，1 worker | 124 ns | 198 ns |
-| spawn + 运行 + 释放，4 workers（放置到空闲 worker） | 258 ns | 419 ns |
-| `Mutex` lock+unlock，无争用 | 14 ns | 29 ns |
-| `Mutex` lock+unlock，8 任务 / 4 workers 争用 | 366 ns | 450 ns |
-| `Channel<long>` 容量 64，1P/1C，2 workers | 15 ns | 51 ns |
-| `Channel<long>` 容量 1，1P/1C，2 workers | 90 ns | 268 ns |
-| TCP loopback echo 往返（1 字节，epoll，2 workers） | 4.0–5.4 µs | 未复测 |
-| TCP loopback echo 往返（1 字节，epoll，1 worker） | 3.7–4.2 µs | 未复测 |
-| TCP loopback echo 往返（poll 后端，2 workers） | 4.7–5.6 µs | 未复测 |
-| 100 任务并发 `sleepFor(200µs)`，每个定时器分摊 | 2.6 µs | 2.8 µs |
+| 协程创建 + 运行 + 销毁（池化栈） | 26 ns | 86 ns |
+| BWoS owner push+pop，无 thief | 2.6 ns | 7 ns |
+| BWoS owner push+pop，3 个 thief 持续窃取 | 5.5 ns | 24–98 ns |
+| Ring（Go 风格）owner push+pop，3 个 thief | 165 ns | 82–433 ns |
+| 调度器 `yield` 两任务直接交接（每次切换） | 15.8 ns | 52 ns |
+| 同 worker park/wake 交接 | 22.5 ns | 58 ns |
+| 跨 worker（pinned）park/wake 交接 | 60 ns | 94 ns |
+| spawn + 运行 + 释放，1 worker | 124 ns | 141 ns |
+| spawn + 运行 + 释放，4 workers（放置到空闲 worker） | 258 ns | 195 ns |
+| `Mutex` lock+unlock，无争用 | 14 ns | 24 ns |
+| `Mutex` lock+unlock，8 任务 / 4 workers 争用 | 366 ns | 390–470 ns |
+| `Channel<long>` 容量 64，1P/1C，2 workers | 15 ns | 45–67 ns |
+| `Channel<long>` 容量 1，1P/1C，2 workers | 90 ns | 347 ns |
+| TCP loopback echo 往返（1 字节，epoll，2 workers） | 4.0–5.4 µs | 11.5–15.9 µs |
+| TCP loopback echo 往返（1 字节，epoll，1 worker） | 3.7–4.2 µs | 13.4–14.2 µs |
+| TCP loopback echo 往返（poll 后端，2 workers） | 4.7–5.6 µs | 15.5–15.7 µs |
+| 100 任务并发 `sleepFor(200µs)`，每个定时器分摊 | 2.6 µs | 3.0 µs |
 
 ### 多核扩展与 Tokio 对照
 
@@ -347,18 +349,19 @@ Tokio 的 `yield_now` 会把任务推迟到本轮之后，语义不同。
 
 ### 空闲与稀疏负载的 CPU 占用
 
-`bench/CpuBench.cpp`（`stackfull_cpu_bench [每个用例秒数] [用例名子串]`）按线程读 `/proc/self/task/*/schedstat`，排除外部生产者线程，只算调度器自己；“裸线程”是同样事件落在一个 `std::thread` 上的下限。x86_64，24 核，默认 24 个 worker，百分比为占一个核：
+`bench/CpuBench.cpp`（`stackfull_cpu_bench [每个用例秒数] [用例名子串]`）按线程读 `/proc/self/task/*/schedstat`，排除外部生产者线程，只算调度器自己；“裸线程”是同样事件落在一个 `std::thread` 上的下限。x86_64 为 24 核、24 个 worker，Android 为上面那台手机、8 个 worker，百分比为占一个核：
 
-| 场景 | 调度器 | 裸线程 |
-|---|---|---|
-| 无任务 / 1 万个 parked 任务 | 0% | — |
-| 1 个任务循环 `sleepFor(1ms)` | 0.6%（每次 1 个线程唤醒） | 0.5–1.1% |
-| 100 任务 × `sleepFor(10ms)` | 3.2–3.9% | — |
-| 1000 任务 × `sleepFor(100ms)` | 7.7–8.2% | — |
-| 外部线程每 1 ms spawn 一个空任务 | 0.6–1.6% | 0.65–1.0% |
-| 外部线程每 10 µs spawn 一个空任务 | 16% | 12–14% |
+| 场景 | x86 调度器 | x86 裸线程 | Android 调度器 | Android 裸线程 |
+|---|---|---|---|---|
+| 无任务 / 1 万个 parked 任务 | 0% | — | 0% | — |
+| 1 个任务循环 `sleepFor(1ms)` | 0.6%（每次 1 个线程唤醒） | 0.5–1.1% | 1.6% | 0.8% |
+| 100 任务 × `sleepFor(10ms)` | 3.2–3.9% | — | 9.2% | — |
+| 1000 任务 × `sleepFor(100ms)` | 7.7–8.2% | — | 5.8% | — |
+| 外部线程每 1 ms spawn 一个空任务 | 0.6–1.6% | 0.65–1.0% | 1.2% | 2.1% |
+| 外部线程每 100 µs spawn 一个空任务 | 1.9% | 1.5% | 16.4% | 12.6% |
+| 外部线程每 10 µs spawn 一个空任务 | 16% | 12–14% | 101%（自旋不再睡） | 57%（只跟上 3.8 万次/秒） |
 
-这张表在系统较空闲时测得。同一台机器在不同时段、不同频率状态下可以差 2–5 倍（批量定时器用例尤其敏感），只有同一时段内交替运行的 A/B 对比才有意义。
+这张表在系统较空闲时测得。手机上一次线程唤醒约 15–35 µs，是 x86 的 10 倍左右，稀疏事件的占用因此高出一个量级；手机在另一个时段测得的同一组数可以高出 1.5–2 倍（裸线程基线同步变化）。同一台机器在不同时段、不同频率状态下可以差 2–5 倍（批量定时器用例尤其敏感），只有同一时段内交替运行的 A/B 对比才有意义。
 
 切换路径上的所有函数（`resume/yield`、`switchTo/onArrival`、`this_task::yield/park`）强制内联：栈切换后返回地址预测器失效，每多一层 `ret` 就多一次约 5 ns 的错误预测；GCC 自己不会内联这些"太大"的函数，实测 34 → 15.8 ns。
 

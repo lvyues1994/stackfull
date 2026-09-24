@@ -35,6 +35,15 @@ struct StallSink {
     virtual void onStall(std::size_t workerIndex, std::chrono::milliseconds stalledFor) noexcept = 0;
 };
 
+// Default for SchedulerOptions::idleSpin: about what a futex sleep/wake
+// round trip costs the CPU (a few microseconds on x86 desktops, tens on
+// the ARM phones measured).
+#if defined(__aarch64__) || defined(__arm__)
+constexpr std::chrono::microseconds kDefaultIdleSpin{20};
+#else
+constexpr std::chrono::microseconds kDefaultIdleSpin{5};
+#endif
+
 struct SchedulerOptions {
     // 0 selects std::thread::hardware_concurrency(). At most 64.
     std::size_t workers = 0;
@@ -80,6 +89,10 @@ struct SchedulerOptions {
     // instead of waking one after another. The first helper for a batch is
     // always woken at once. 0 restores immediate ramp-up.
     std::chrono::microseconds rampUpDelay{50};
+    // How long an idle worker spins looking for work before it sleeps.
+    // Worth it while work arrives faster than a sleep/wake round trip
+    // costs; spins that keep missing back off on their own. 0 never spins.
+    std::chrono::microseconds idleSpin = kDefaultIdleSpin;
     // Fill SchedulerStats::wakeLatency: a clock read when a task becomes
     // runnable and when it runs again.
     bool recordWakeLatency = false;

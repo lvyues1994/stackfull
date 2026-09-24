@@ -73,6 +73,7 @@ struct SchedulerImpl final : Scheduler {
             return;
         }
         core_.wakeAllParked();
+        core_.parkedWoken.store(true, std::memory_order_release);
         for (auto const &worker : core_.workers) {
             core_.unparkWorker(*worker);
         }

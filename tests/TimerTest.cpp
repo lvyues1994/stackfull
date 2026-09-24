@@ -101,7 +101,7 @@ TEST(Timer, RepeatedSleepsAcrossManyWorkersWakeOnTime) {
     constexpr int kRounds = 5;
     WaitGroup done;
     done.add(kSleepers);
-    std::atomic<long> worstLateMicros{0};
+    std::atomic<std::chrono::microseconds::rep> worstLateMicros{0};
     for (int i = 0; i < kSleepers; ++i) {
         ASSERT_TRUE(scheduler->spawn([&, i] {
             std::mt19937 rng(static_cast<unsigned>(i));
@@ -110,7 +110,7 @@ TEST(Timer, RepeatedSleepsAcrossManyWorkersWakeOnTime) {
                 auto const start = Clock::now();
                 this_task::sleepFor(wanted);
                 auto const late = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - start - wanted);
-                long seen = worstLateMicros.load();
+                auto seen = worstLateMicros.load();
                 while (late.count() > seen and not worstLateMicros.compare_exchange_weak(seen, late.count())) {
                 }
                 EXPECT_GE(late.count(), 0);

@@ -189,11 +189,13 @@ TEST_P(IoTest, TcpEchoManyConnections) {
                     if (not got or got.bytes == 0) {
                         return;
                     }
+                    // Counted before the reply goes out: the client may finish
+                    // (and the test check the count) as soon as it arrives.
+                    echoed.fetch_add(1);
                     IoResult const sent = io::writeAll(registration, buffer, got.bytes);
                     if (not sent) {
                         return;
                     }
-                    echoed.fetch_add(1);
                 }
             }));
         }

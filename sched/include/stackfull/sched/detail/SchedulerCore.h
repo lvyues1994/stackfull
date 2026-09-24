@@ -143,6 +143,9 @@ struct SchedulerCore {
     std::atomic<std::uint64_t> foreignFinished{0};
     std::atomic<std::uint32_t> workersRunning{0};
     std::atomic<bool> stopping{false};
+    // Set by stop() once every parked task has been woken; only then may
+    // workers unwind the tasks still parked.
+    std::atomic<bool> parkedWoken{false};
 
     Driver *driver = nullptr;
     std::atomic<Worker *> timekeeper{nullptr};

@@ -812,6 +812,32 @@ TEST(Scheduler, StopWakesParkedTasksOnce) {
     EXPECT_EQ(exited.load(), 4);
 }
 
+// stop() wakes every parked task once before unwinding the ones still
+// parked; workers that are already busy running the first woken tasks must
+// not reap the rest before their wake has been delivered.
+TEST(Scheduler, StopWakesEveryParkedTaskBeforeUnwindingAny) {
+    auto scheduler = makeScheduler(withWorkers(4));
+    constexpr int kTasks = 2000;
+    std::atomic<int> parked{0};
+    std::atomic<int> exited{0};
+    for (int t = 0; t < kTasks; ++t) {
+        ASSERT_TRUE(scheduler->spawn([&] {
+            parked.fetch_add(1);
+            while (not this_task::stopRequested()) {
+                this_task::park();
+            }
+            exited.fetch_add(1);
+        }));
+    }
+    while (parked.load() < kTasks) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds{5});
+    scheduler->stop();
+    ASSERT_TRUE(waitIdle(*scheduler));
+    EXPECT_EQ(exited.load(), kTasks);
+}
+
 TEST(Scheduler, RunOnCallingThreadReturnsAfterStop) {
     SchedulerOptions options = withWorkers(2);
     options.callerIsWorker = true;

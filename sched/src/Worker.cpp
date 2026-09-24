@@ -39,7 +39,6 @@ constexpr unsigned kInjectionCheckPeriod = 61;
 // Idle spinning is bounded by time, not iterations: a core just out of a
 // deep idle state runs slowly, and an iteration budget there costs tens of
 // microseconds. One spinner already spares producers their futex wake.
-constexpr std::chrono::microseconds kSpinBudget{5};
 constexpr std::uint32_t kMaxSpinners = 2;
 // From the second empty spin in a row, the next 2, 4, ... up to this many
 // idle episodes go straight to sleep before spinning is tried again. A
@@ -110,7 +109,11 @@ void Worker::run() {
         }
         if (task == nullptr) {
             if (core.stopping.load(std::memory_order_acquire)) {
-                reapParkedTasks();
+                // Not before stop() has woken every parked task once: a task
+                // it has not reached yet must get to see stopRequested().
+                if (core.parkedWoken.load(std::memory_order_acquire)) {
+                    reapParkedTasks();
+                }
                 if (core.liveTasks() == 0) {
                     break;
                 }
@@ -211,7 +214,7 @@ void Worker::wakePeerForLeftovers() noexcept {
     }
 }
 
-// Before sleeping, spin as a searcher for up to kSpinBudget. Producers skip
+// Before sleeping, spin as a searcher for up to options.idleSpin. Producers skip
 // the futex wake while any worker is searching, so back-to-back handoffs
 // never pay a wake/sleep syscall pair. At most kMaxSpinners spin at once,
 // and spins that keep coming up empty back off exponentially: work arriving
@@ -219,6 +222,14 @@ void Worker::wakePeerForLeftovers() noexcept {
 // switch back to rapid handoffs is picked up within kMaxSpinBackoff idle
 // episodes.
 Task *Worker::spinForWork() noexcept {
+    if (core.options.idleSpin.count() <= 0) {
+        return nullptr;
+    }
+    // With nobody polling the driver we are next to: spinning would only
+    // delay noticing IO readiness, which the spin does not look at.
+    if (core.driver != nullptr and core.timekeeper.load(std::memory_order_relaxed) == nullptr) {
+        return nullptr;
+    }
     if (spinSkips != 0) {
         --spinSkips;
         return nullptr;
@@ -232,7 +243,7 @@ Task *Worker::spinForWork() noexcept {
                                                       std::memory_order_relaxed));
 
     Task *task = nullptr;
-    auto const deadline = std::chrono::steady_clock::now() + kSpinBudget;
+    auto const deadline = std::chrono::steady_clock::now() + core.options.idleSpin;
     for (unsigned i = 1; task == nullptr; ++i) {
         task = takeLocal();
         if (task == nullptr and core.hasInjectedWork()) {
