@@ -29,16 +29,19 @@ inline bool has(Interest const set, Interest const bit) noexcept {
 // timekeeper worker sleeps inside wait() and readiness turns straight into
 // task wakeups; other threads may register descriptors concurrently.
 //
-// Readiness is *one-shot*: after an event is delivered for a descriptor the
-// poller stops watching it until the next arm(). Registration::waitReadable /
-// waitWritable arm on every wait, so a descriptor that nobody waits on
-// costs nothing.
+// A poller reports readiness through Registration::collect(), which counts
+// it; waiters compare counts (see Registration). Two ways to watch:
+//   - edge-triggered (epoll): both directions are watched from add() on and
+//     every edge is reported; arm() does nothing, so waits cost no system
+//     call beyond the one that hit EAGAIN;
+//   - one-shot (poll): arm() watches the given directions until the next
+//     report for the descriptor.
 struct Poller : sched::Driver {
-    // Start tracking `registration.fd()` with no interest yet.
+    // Start tracking `registration.fd()`.
     virtual std::error_code add(Registration &registration) noexcept = 0;
     // Stop tracking; after this returns no further readiness is delivered.
     virtual void remove(Registration &registration) noexcept = 0;
-    // Watch `interest` until the next event for this descriptor.
+    // Called before each wait with the directions someone waits on.
     virtual std::error_code arm(Registration &registration, Interest interest) noexcept = 0;
 };
 

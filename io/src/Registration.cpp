@@ -6,14 +6,6 @@
 namespace stackfull {
 namespace io {
 
-namespace {
-
-std::uint8_t bits(Interest const interest) noexcept {
-    return static_cast<std::uint8_t>(interest);
-}
-
-} // namespace
-
 Registration::Registration(Poller &poller_, int const fd_) noexcept : owner(poller_), descriptor(fd_) {
     addError = owner.add(*this);
 }
@@ -24,80 +16,103 @@ Registration::~Registration() {
     }
 }
 
+std::error_code Registration::waitReadable(std::uint32_t const seen) {
+    return waitFor(Interest::Readable, seen, false, TimePoint{});
+}
+
+std::error_code Registration::waitWritable(std::uint32_t const seen) {
+    return waitFor(Interest::Writable, seen, false, TimePoint{});
+}
+
+std::error_code Registration::waitReadableUntil(std::uint32_t const seen, TimePoint const deadline) {
+    return waitFor(Interest::Readable, seen, true, deadline);
+}
+
+std::error_code Registration::waitWritableUntil(std::uint32_t const seen, TimePoint const deadline) {
+    return waitFor(Interest::Writable, seen, true, deadline);
+}
+
 std::error_code Registration::waitReadable() {
-    return waitFor(Interest::Readable);
+    std::error_code const error = waitFor(Interest::Readable, read.consumed, false, TimePoint{});
+    read.consumed = readEvents();
+    return error;
 }
 
 std::error_code Registration::waitWritable() {
-    return waitFor(Interest::Writable);
+    std::error_code const error = waitFor(Interest::Writable, write.consumed, false, TimePoint{});
+    write.consumed = writeEvents();
+    return error;
 }
 
-std::error_code Registration::waitFor(Interest const direction) {
+std::error_code Registration::waitFor(Interest const direction, std::uint32_t const seen, bool const hasDeadline,
+                                      TimePoint const deadline) {
     if (addError) {
         return addError;
     }
-    std::uint8_t const bit = bits(direction);
+    Direction &mine = slot(direction);
+    if (mine.events.load(std::memory_order_acquire) != seen) {
+        return std::error_code{};
+    }
     sync::detail::Waiter waiter;
     sync::detail::Waker const me = waiter.waker();
-    // Any way out, forced unwind included: take our waker back if deliver()
-    // has not already. Nothing ever points into this frame.
+    // Any way out, forced unwind and timeout included: take our waker back
+    // if collect() has not already. Nothing ever points into this frame.
     struct DetachOnExit {
         Registration &self;
         Interest direction;
         sync::detail::Waker const &me;
         ~DetachOnExit() { self.detach(direction, me); }
     } detachOnExit{*this, direction, me};
-    for (;;) {
-        // Consume a report that already arrived.
-        if ((ready.load(std::memory_order_acquire) & bit) != 0) {
-            ready.fetch_and(static_cast<std::uint8_t>(~bit), std::memory_order_acq_rel);
-            return std::error_code{};
-        }
-        Interest armed = Interest::None;
-        {
-            sync::SpinLockGuard const guard(lock);
-            (direction == Interest::Readable ? readWaker : writeWaker) = me;
-            // Arm for everything anyone currently waits on, so a concurrent
-            // waiter in the other direction is not disarmed by our one-shot.
-            armed = (readWaker.isEmpty() ? Interest::None : Interest::Readable) |
-                    (writeWaker.isEmpty() ? Interest::None : Interest::Writable);
-        }
-        if (std::error_code const error = owner.arm(*this, armed)) {
-            return error;
-        }
-        // deliver() sets the bit before waking and wakeups are sticky, so a
-        // report landing before we block is not lost.
-        while ((ready.load(std::memory_order_acquire) & bit) == 0) {
+
+    Interest armed = Interest::None;
+    {
+        sync::SpinLockGuard const guard(lock);
+        mine.waker = me;
+        // Pollers without edge triggering watch one-shot: arm for everything
+        // anyone waits on, so the other direction's waiter is not disarmed.
+        armed = (read.waker.isEmpty() ? Interest::None : Interest::Readable) |
+                (write.waker.isEmpty() ? Interest::None : Interest::Writable);
+    }
+    if (std::error_code const error = owner.arm(*this, armed)) {
+        return error;
+    }
+    // collect() bumps the count before waking and wakeups are sticky, so a
+    // report landing before we block is not lost.
+    while (mine.events.load(std::memory_order_acquire) == seen) {
+        if (not hasDeadline) {
             waiter.block();
+        } else if (not waiter.blockUntil(deadline)) {
+            if (mine.events.load(std::memory_order_acquire) != seen) {
+                break; // arrived just as we timed out
+            }
+            return std::make_error_code(std::errc::timed_out);
         }
     }
+    return std::error_code{};
 }
 
 void Registration::detach(Interest const direction, sync::detail::Waker const &waker) noexcept {
     sync::SpinLockGuard const guard(lock);
-    sync::detail::Waker &slot = direction == Interest::Readable ? readWaker : writeWaker;
-    if (slot == waker) {
-        slot.clear();
+    sync::detail::Waker &waiting = slot(direction).waker;
+    if (waiting == waker) {
+        waiting.clear();
     }
 }
 
-void Registration::deliver(Interest const readyNow) noexcept {
-    sync::detail::Waker reader;
-    sync::detail::Waker writer;
-    {
-        sync::SpinLockGuard const guard(lock);
-        ready.fetch_or(bits(readyNow), std::memory_order_acq_rel);
-        if (has(readyNow, Interest::Readable)) {
-            reader = readWaker;
-            readWaker.clear();
-        }
-        if (has(readyNow, Interest::Writable)) {
-            writer = writeWaker;
-            writeWaker.clear();
-        }
+Registration::Wakeups Registration::collect(Interest const readyNow) noexcept {
+    Wakeups wakeups;
+    sync::SpinLockGuard const guard(lock);
+    if (has(readyNow, Interest::Readable)) {
+        read.events.fetch_add(1, std::memory_order_acq_rel);
+        wakeups.reader = read.waker;
+        read.waker.clear();
     }
-    reader.wake();
-    writer.wake();
+    if (has(readyNow, Interest::Writable)) {
+        write.events.fetch_add(1, std::memory_order_acq_rel);
+        wakeups.writer = write.waker;
+        write.waker.clear();
+    }
+    return wakeups;
 }
 
 } // namespace io

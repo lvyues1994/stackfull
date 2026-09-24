@@ -22,15 +22,18 @@ namespace io {
 
 namespace {
 
-// epoll with one-shot interest. Events carry the descriptor number, not a
-// pointer: the registration table is consulted under a lock at dispatch
-// time, so a Registration destroyed between epoll_wait() returning and the
-// event being processed is simply not found instead of being dereferenced.
+// Edge-triggered epoll. Each descriptor is added once, watching both
+// directions; waits never call epoll_ctl. Events carry the descriptor
+// number, not a pointer: the registration table is consulted under a lock
+// at dispatch time, so a Registration destroyed between epoll_wait()
+// returning and the event being processed is simply not found. A stale
+// event for a reused descriptor only bumps a count, which waiters treat
+// as a spurious wakeup.
 struct EpollPoller final : Poller {
     EpollPoller() : epollFd(::epoll_create1(EPOLL_CLOEXEC)), wakeFd(::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK)) {
         STACKFULL_CHECK(epollFd and wakeFd, "stackfull: epoll_create1/eventfd failed");
         epoll_event event{};
-        event.events = EPOLLIN;
+        event.events = EPOLLIN; // level-triggered: drained on every wakeup
         event.data.fd = wakeFd.get();
         STACKFULL_CHECK(::epoll_ctl(epollFd.get(), EPOLL_CTL_ADD, wakeFd.get(), &event) == 0,
                         "stackfull: epoll_ctl(ADD eventfd) failed");
@@ -41,9 +44,6 @@ struct EpollPoller final : Poller {
         if (fd < 0) {
             return std::make_error_code(std::errc::bad_file_descriptor);
         }
-        epoll_event event{};
-        event.events = EPOLLONESHOT; // no interest until the first arm()
-        event.data.fd = fd;
         {
             sync::SpinLockGuard const guard(tableLock);
             if (static_cast<std::size_t>(fd) >= table.size()) {
@@ -54,6 +54,9 @@ struct EpollPoller final : Poller {
             }
             table[static_cast<std::size_t>(fd)] = &registration;
         }
+        epoll_event event{};
+        event.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET;
+        event.data.fd = fd;
         if (::epoll_ctl(epollFd.get(), EPOLL_CTL_ADD, fd, &event) != 0) {
             std::error_code const error = lastError();
             sync::SpinLockGuard const guard(tableLock);
@@ -74,20 +77,8 @@ struct EpollPoller final : Poller {
         ::epoll_ctl(epollFd.get(), EPOLL_CTL_DEL, fd, nullptr);
     }
 
-    std::error_code arm(Registration &registration, Interest const interest) noexcept override {
-        epoll_event event{};
-        event.events = EPOLLONESHOT | EPOLLRDHUP;
-        if (has(interest, Interest::Readable)) {
-            event.events |= EPOLLIN;
-        }
-        if (has(interest, Interest::Writable)) {
-            event.events |= EPOLLOUT;
-        }
-        event.data.fd = registration.fd();
-        if (::epoll_ctl(epollFd.get(), EPOLL_CTL_MOD, registration.fd(), &event) != 0) {
-            return lastError();
-        }
-        return std::error_code{};
+    std::error_code arm(Registration &, Interest) noexcept override {
+        return std::error_code{}; // edge-triggered: always watching
     }
 
     void wait(std::chrono::nanoseconds const timeout) override {
@@ -99,8 +90,33 @@ struct EpollPoller final : Poller {
         }
         epoll_event events[kBatch];
         int const count = ::epoll_wait(epollFd.get(), events, kBatch, millis);
-        for (int i = 0; i < count; ++i) {
-            dispatch(events[i]);
+        if (count <= 0) {
+            return;
+        }
+        // One pass under the table lock records readiness and takes the
+        // waiters; they are woken after it is released.
+        Registration::Wakeups wakeups[kBatch];
+        int taken = 0;
+        {
+            sync::SpinLockGuard const guard(tableLock);
+            for (int i = 0; i < count; ++i) {
+                int const fd = events[i].data.fd;
+                if (fd == wakeFd.get()) {
+                    std::uint64_t drained = 0;
+                    ssize_t const got = ::read(wakeFd.get(), &drained, sizeof drained);
+                    static_cast<void>(got);
+                    continue;
+                }
+                if (static_cast<std::size_t>(fd) >= table.size()) {
+                    continue;
+                }
+                if (Registration *const registration = table[static_cast<std::size_t>(fd)]) {
+                    wakeups[taken++] = registration->collect(readyOf(events[i].events));
+                }
+            }
+        }
+        for (int i = 0; i < taken; ++i) {
+            wakeups[i].wake();
         }
     }
 
@@ -113,29 +129,15 @@ struct EpollPoller final : Poller {
 private:
     static constexpr int kBatch = 64;
 
-    void dispatch(epoll_event const &event) noexcept {
-        int const fd = event.data.fd;
-        if (fd == wakeFd.get()) {
-            std::uint64_t drained = 0;
-            ssize_t const got = ::read(wakeFd.get(), &drained, sizeof drained);
-            static_cast<void>(got);
-            return;
-        }
+    static Interest readyOf(std::uint32_t const events) noexcept {
         Interest ready = Interest::None;
-        if ((event.events & (EPOLLIN | EPOLLRDHUP | EPOLLHUP | EPOLLERR)) != 0) {
+        if ((events & (EPOLLIN | EPOLLRDHUP | EPOLLHUP | EPOLLERR)) != 0) {
             ready = ready | Interest::Readable;
         }
-        if ((event.events & (EPOLLOUT | EPOLLHUP | EPOLLERR)) != 0) {
+        if ((events & (EPOLLOUT | EPOLLHUP | EPOLLERR)) != 0) {
             ready = ready | Interest::Writable;
         }
-        // Deliver under the table lock: remove() nulls the slot under the
-        // same lock, so a registration we find is alive for the whole call.
-        sync::SpinLockGuard const guard(tableLock);
-        if (static_cast<std::size_t>(fd) < table.size()) {
-            if (Registration *const registration = table[static_cast<std::size_t>(fd)]) {
-                registration->deliver(ready);
-            }
-        }
+        return ready;
     }
 
     Fd epollFd;

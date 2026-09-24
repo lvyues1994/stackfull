@@ -109,11 +109,20 @@ struct PollPoller final : Poller {
             while (::read(wakeRead.get(), drain, sizeof drain) > 0) {
             }
         }
-        for (std::size_t i = 1; i < snapshot.size(); ++i) {
-            if (snapshot[i].revents != 0) {
-                dispatch(snapshot[i]);
+        // Record readiness and take the waiters in one pass under the lock;
+        // wake them after releasing it.
+        {
+            sync::SpinLockGuard const guard(lock);
+            for (std::size_t i = 1; i < snapshot.size(); ++i) {
+                if (snapshot[i].revents != 0) {
+                    collectLocked(snapshot[i]);
+                }
             }
         }
+        for (Registration::Wakeups const &wakeups : pending) {
+            wakeups.wake();
+        }
+        pending.clear();
     }
 
     void wake() override {
@@ -128,7 +137,7 @@ private:
         short events = 0;
     };
 
-    void dispatch(pollfd const &item) noexcept {
+    void collectLocked(pollfd const &item) {
         Interest ready = Interest::None;
         if ((item.revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL)) != 0) {
             ready = ready | Interest::Readable;
@@ -136,7 +145,6 @@ private:
         if ((item.revents & (POLLOUT | POLLHUP | POLLERR | POLLNVAL)) != 0) {
             ready = ready | Interest::Writable;
         }
-        sync::SpinLockGuard const guard(lock);
         auto const index = static_cast<std::size_t>(item.fd);
         if (index < table.size() and table[index].registration != nullptr) {
             // One-shot: stop watching until the next arm().
@@ -148,7 +156,7 @@ private:
                 table[index].events = static_cast<short>(table[index].events & ~POLLOUT);
             }
             if (watched != 0) {
-                table[index].registration->deliver(ready);
+                pending.push_back(table[index].registration->collect(ready));
             }
         }
     }
@@ -157,7 +165,9 @@ private:
     Fd wakeWrite;
     sync::SpinLock lock;
     std::vector<Entry> table;
+    // Used only inside wait(), which one thread at a time runs.
     std::vector<pollfd> snapshot;
+    std::vector<Registration::Wakeups> pending;
 };
 
 } // namespace

@@ -2,6 +2,7 @@
 
 #include <cerrno>
 #include <cstddef>
+#include <cstdint>
 
 #include <sys/socket.h>
 #include <unistd.h>
@@ -17,8 +18,13 @@ bool wouldBlock(int const error) noexcept {
 
 } // namespace
 
+// Every operation snapshots the direction's event count *before* its system
+// call and, on EAGAIN, waits for a newer report: with edge triggering a
+// report that arrives between the two is not lost (see Registration).
+
 IoResult read(Registration &registration, void *const buffer, std::size_t const length) {
     for (;;) {
+        std::uint32_t const seen = registration.readEvents();
         ssize_t const n = ::read(registration.fd(), buffer, length);
         if (n >= 0) {
             return IoResult{static_cast<std::size_t>(n), std::error_code{}};
@@ -29,7 +35,7 @@ IoResult read(Registration &registration, void *const buffer, std::size_t const 
         if (not wouldBlock(errno)) {
             return IoResult{0, lastError()};
         }
-        if (std::error_code const error = registration.waitReadable()) {
+        if (std::error_code const error = registration.waitReadable(seen)) {
             return IoResult{0, error};
         }
     }
@@ -37,6 +43,7 @@ IoResult read(Registration &registration, void *const buffer, std::size_t const 
 
 IoResult write(Registration &registration, void const *const buffer, std::size_t const length) {
     for (;;) {
+        std::uint32_t const seen = registration.writeEvents();
         ssize_t const n = ::write(registration.fd(), buffer, length);
         if (n >= 0) {
             return IoResult{static_cast<std::size_t>(n), std::error_code{}};
@@ -47,7 +54,7 @@ IoResult write(Registration &registration, void const *const buffer, std::size_t
         if (not wouldBlock(errno)) {
             return IoResult{0, lastError()};
         }
-        if (std::error_code const error = registration.waitWritable()) {
+        if (std::error_code const error = registration.waitWritable(seen)) {
             return IoResult{0, error};
         }
     }
@@ -82,6 +89,7 @@ IoResult readExactly(Registration &registration, void *const buffer, std::size_t
 
 AcceptResult accept(Registration &listener) {
     for (;;) {
+        std::uint32_t const seen = listener.readEvents();
 #if defined(SOCK_NONBLOCK) && defined(SOCK_CLOEXEC)
         int const fd = ::accept4(listener.fd(), nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
 #else
@@ -102,13 +110,14 @@ AcceptResult accept(Registration &listener) {
         if (not wouldBlock(errno)) {
             return AcceptResult{Fd{}, lastError()};
         }
-        if (std::error_code const error = listener.waitReadable()) {
+        if (std::error_code const error = listener.waitReadable(seen)) {
             return AcceptResult{Fd{}, error};
         }
     }
 }
 
 std::error_code connect(Registration &registration, sockaddr const *const address, socklen_t const length) {
+    std::uint32_t const seen = registration.writeEvents();
     for (;;) {
         if (::connect(registration.fd(), address, length) == 0) {
             return std::error_code{};
@@ -124,7 +133,7 @@ std::error_code connect(Registration &registration, sockaddr const *const addres
         }
         break;
     }
-    if (std::error_code const error = registration.waitWritable()) {
+    if (std::error_code const error = registration.waitWritable(seen)) {
         return error;
     }
     int soError = 0;
