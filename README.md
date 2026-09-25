@@ -327,6 +327,8 @@ cmake --preset release && cmake --build --preset release && ctest --preset relea
 | `android-arm64` / `android-arm64-api24` / `android-armv7` | 需要 `ANDROID_NDK_HOME` |
 | `qnx-aarch64le` / `qnx-x86_64` | 需要先 `source qnxsdp-env.sh` |
 
+CI（`.github/workflows/ci.yml`）在 GitHub 的 Ubuntu 24.04 托管机器上对上表 7 个 Linux 预设各跑一遍配置、编译和全量测试；Android 和 QNX 不在 CI 里。
+
 CMake 选项：`STACKFULL_EXCEPTIONS`、`STACKFULL_SWAP_EH_GLOBALS`、`STACKFULL_TLS_BACKEND`（AUTO / THREAD_LOCAL / PTHREAD_KEY，AUTO 在 Android API < 29 选 pthread_key 以避开 emutls）、`STACKFULL_SCHED_QUEUE`（BWOS / RING）、`STACKFULL_SANITIZE`。
 
 Android 设备上跑测试：`cmake --preset android-arm64 -DSTACKFULL_BUILD_TESTS=ON && cmake --build --preset android-arm64`，把 `build/android-arm64/tests/*_test` `adb push` 到 `/data/local/tmp` 直接运行（`c++_static`，无额外依赖）。
