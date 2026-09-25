@@ -13,6 +13,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <csignal>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -623,6 +624,50 @@ TEST_P(IoTest, DataAndEndOfStreamArrivingTogetherAreBothRead) {
     EXPECT_EQ(end.bytes, 0u);
 }
 
+// With SIGPIPE at its default action a raised one would end the test binary.
+TEST_P(IoTest, WriteToAResetConnectionFailsInsteadOfRaisingSigpipe) {
+    struct RestoreSigpipe {
+        void (*previous)(int) = std::signal(SIGPIPE, SIG_DFL);
+        ~RestoreSigpipe() { std::signal(SIGPIPE, previous); }
+    } restore;
+    TcpListenerResult bound = TcpListener::bind(*poller, SocketAddress::loopback(0));
+    ASSERT_TRUE(bound);
+    TcpListener &listener = *bound.listener;
+    WaitGroup done;
+    done.add(2);
+    std::atomic<bool> connected{false};
+    std::error_code writeError;
+    ASSERT_TRUE(scheduler->spawn([&] {
+        TcpStreamResult peer = listener.accept();
+        EXPECT_TRUE(peer);
+        while (not connected.load()) {
+            this_task::sleepFor(milliseconds{1});
+        }
+        if (peer) {
+            linger const abort{1, 0}; // close with a reset
+            ::setsockopt(peer.stream->fd(), SOL_SOCKET, SO_LINGER, &abort, sizeof abort);
+        }
+        done.done();
+    }));
+    ASSERT_TRUE(scheduler->spawn([&] {
+        TcpStreamResult client = TcpStream::connect(*poller, SocketAddress::loopback(listener.port()));
+        EXPECT_TRUE(client) << client.error.message();
+        connected.store(true);
+        if (client) {
+            this_task::sleepFor(milliseconds{20});
+            std::vector<char> data(64 * 1024, 'x');
+            // The first write after the reset reports ECONNRESET; the ones
+            // after it EPIPE, which is where SIGPIPE would come from.
+            for (int i = 0; i < 100 and writeError != std::errc::broken_pipe; ++i) {
+                writeError = client.stream->writeAll(data.data(), data.size()).error;
+            }
+        }
+        done.done();
+    }));
+    done.wait();
+    EXPECT_EQ(writeError, std::errc::broken_pipe) << writeError.message();
+}
+
 TEST_P(IoTest, PipeDataAndHangUpArrivingTogetherAreBothRead) {
     int ends[2] = {-1, -1};
     ASSERT_EQ(::pipe(ends), 0);
@@ -638,7 +683,7 @@ TEST_P(IoTest, PipeDataAndHangUpArrivingTogetherAreBothRead) {
     ASSERT_TRUE(scheduler->spawn([&] {
         {
             Registration registration(*poller, readEnd.get());
-            registration.setByteStream(true);
+            registration.setKind(Registration::Kind::Pipe);
             this_task::sleepFor(milliseconds{30});
             char buffer[64];
             IoResult const got = io::read(registration, buffer, sizeof buffer);

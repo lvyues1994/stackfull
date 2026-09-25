@@ -65,16 +65,31 @@ IoResult transferOnce(Registration &registration, Interest const direction, std:
     }
 }
 
+#if defined(MSG_NOSIGNAL)
+constexpr int kNoSigPipe = MSG_NOSIGNAL;
+#else
+constexpr int kNoSigPipe = 0;
+#endif
+
 IoResult readImpl(Registration &registration, void *const buffer, std::size_t const length,
                   Deadline const *const deadline) {
-    return transferOnce(registration, Interest::Readable, length, deadline,
-                        [&] { return ::read(registration.fd(), buffer, length); });
+    int const fd = registration.fd();
+    if (registration.isSocket()) {
+        return transferOnce(registration, Interest::Readable, length, deadline,
+                            [&] { return ::recv(fd, buffer, length, 0); });
+    }
+    return transferOnce(registration, Interest::Readable, length, deadline, [&] { return ::read(fd, buffer, length); });
 }
 
 IoResult writeImpl(Registration &registration, void const *const buffer, std::size_t const length,
                    Deadline const *const deadline) {
+    int const fd = registration.fd();
+    if (registration.isSocket()) {
+        return transferOnce(registration, Interest::Writable, length, deadline,
+                            [&] { return ::send(fd, buffer, length, kNoSigPipe); });
+    }
     return transferOnce(registration, Interest::Writable, length, deadline,
-                        [&] { return ::write(registration.fd(), buffer, length); });
+                        [&] { return ::write(fd, buffer, length); });
 }
 
 std::size_t totalLength(iovec const *const vectors, int const count) noexcept {
@@ -83,6 +98,13 @@ std::size_t totalLength(iovec const *const vectors, int const count) noexcept {
         total += vectors[i].iov_len;
     }
     return total;
+}
+
+msghdr messageOf(iovec const *const vectors, int const count) noexcept {
+    msghdr message{};
+    message.msg_iov = const_cast<iovec *>(vectors);
+    message.msg_iovlen = static_cast<decltype(message.msg_iovlen)>(count);
+    return message;
 }
 
 IoResult writeAllImpl(Registration &registration, void const *const buffer, std::size_t const length,
@@ -195,13 +217,24 @@ IoResult readExactly(Registration &registration, void *const buffer, std::size_t
 }
 
 IoResult readv(Registration &registration, iovec const *const vectors, int const count) {
-    return transferOnce(registration, Interest::Readable, totalLength(vectors, count), nullptr,
-                        [&] { return ::readv(registration.fd(), vectors, count); });
+    int const fd = registration.fd();
+    std::size_t const asked = totalLength(vectors, count);
+    if (registration.isSocket()) {
+        msghdr message = messageOf(vectors, count);
+        return transferOnce(registration, Interest::Readable, asked, nullptr, [&] { return ::recvmsg(fd, &message, 0); });
+    }
+    return transferOnce(registration, Interest::Readable, asked, nullptr, [&] { return ::readv(fd, vectors, count); });
 }
 
 IoResult writev(Registration &registration, iovec const *const vectors, int const count) {
-    return transferOnce(registration, Interest::Writable, totalLength(vectors, count), nullptr,
-                        [&] { return ::writev(registration.fd(), vectors, count); });
+    int const fd = registration.fd();
+    std::size_t const asked = totalLength(vectors, count);
+    if (registration.isSocket()) {
+        msghdr const message = messageOf(vectors, count);
+        return transferOnce(registration, Interest::Writable, asked, nullptr,
+                            [&] { return ::sendmsg(fd, &message, kNoSigPipe); });
+    }
+    return transferOnce(registration, Interest::Writable, asked, nullptr, [&] { return ::writev(fd, vectors, count); });
 }
 
 IoResult writevAll(Registration &registration, iovec *vectors, int count) {

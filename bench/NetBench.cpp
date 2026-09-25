@@ -17,6 +17,7 @@
 
 #include <stackfull/io/Poller.h>
 #include <stackfull/io/TcpStream.h>
+#include <stackfull/sched/Affinity.h>
 #include <stackfull/sched/Scheduler.h>
 #include <stackfull/sync/WaitGroup.h>
 
@@ -40,6 +41,7 @@
 #include <unistd.h>
 
 #if defined(__linux__)
+#include <sched.h>
 #include <sys/epoll.h>
 #endif
 
@@ -51,10 +53,32 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
-std::unique_ptr<Scheduler> makeNetScheduler(Poller &poller, std::size_t const workers) {
+// With `pinWorkers`, worker i stays on the i-th CPU of the process's
+// affinity mask (the load generator: less run-to-run placement noise).
+std::unique_ptr<Scheduler> makeNetScheduler(Poller &poller, std::size_t const workers, bool const pinWorkers = false) {
     SchedulerOptions options;
     options.workers = workers;
     options.driver = &poller;
+#if defined(__linux__)
+    cpu_set_t allowed;
+    CPU_ZERO(&allowed);
+    std::vector<int> cpus;
+    if (pinWorkers and ::sched_getaffinity(0, sizeof allowed, &allowed) == 0) {
+        for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+            if (CPU_ISSET(cpu, &allowed)) {
+                cpus.push_back(cpu);
+            }
+        }
+    }
+    if (not cpus.empty()) {
+        options.onWorkerStart = [cpus](std::size_t const index) {
+            int const cpu = cpus[index % cpus.size()];
+            pinCurrentThreadToCpus(&cpu, 1);
+        };
+    }
+#else
+    static_cast<void>(pinWorkers);
+#endif
     return makeScheduler(options);
 }
 
@@ -153,7 +177,7 @@ struct RawConnection {
 
 void flushPending(RawConnection &connection) {
     while (not connection.pending.empty()) {
-        ssize_t const n = ::write(connection.fd, connection.pending.data(), connection.pending.size());
+        ssize_t const n = ::send(connection.fd, connection.pending.data(), connection.pending.size(), MSG_NOSIGNAL);
         if (n <= 0) {
             return; // EAGAIN: EPOLLOUT resumes
         }
@@ -163,7 +187,7 @@ void flushPending(RawConnection &connection) {
 
 bool serveReadable(RawConnection &connection, char *const buffer, std::size_t const size) {
     for (;;) {
-        ssize_t const n = ::read(connection.fd, buffer, size);
+        ssize_t const n = ::recv(connection.fd, buffer, size, 0);
         if (n == 0) {
             return false;
         }
@@ -171,7 +195,7 @@ bool serveReadable(RawConnection &connection, char *const buffer, std::size_t co
             return errno == EAGAIN;
         }
         if (connection.pending.empty()) {
-            ssize_t const sent = ::write(connection.fd, buffer, static_cast<std::size_t>(n));
+            ssize_t const sent = ::send(connection.fd, buffer, static_cast<std::size_t>(n), MSG_NOSIGNAL);
             std::size_t const done = sent > 0 ? static_cast<std::size_t>(sent) : 0;
             connection.pending.append(buffer + done, static_cast<std::size_t>(n) - done);
         } else {
@@ -242,7 +266,7 @@ int runRawServer(std::uint16_t const port, std::size_t const threads, double con
 int runClient(std::uint16_t const port, int const connections, std::size_t const bytes, double const seconds,
               std::size_t const workers) {
     auto poller = makeDefaultPoller();
-    auto scheduler = makeNetScheduler(*poller, workers);
+    auto scheduler = makeNetScheduler(*poller, workers, true);
     std::atomic<bool> counting{false};
     std::atomic<bool> stop{false};
     std::atomic<int> connected{0};

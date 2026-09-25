@@ -62,13 +62,26 @@ struct Registration {
     std::error_code waitReadable();
     std::error_code waitWritable();
 
-    // Byte-stream descriptors (TCP and Unix stream sockets, pipes): a read
-    // that returns fewer bytes than asked emptied the receive buffer, a
-    // write that takes fewer filled the send buffer. With a poller that
-    // reports every arrival, the next transfer then waits for a newer report
-    // instead of calling the kernel only to hit EAGAIN. Off by default: a
-    // datagram read is short without draining anything.
-    void setByteStream(bool const enabled) noexcept { byteStream = enabled and everyArrivalReported; }
+    // What the descriptor is; the transfer functions (Async.h) go by it.
+    //   - Sockets are read and written with recv/send: no file-permission
+    //     hooks on every call (AppArmor, SELinux), and a write to a reset
+    //     connection fails with EPIPE instead of raising SIGPIPE.
+    //   - Byte streams: a read that returns fewer bytes than asked emptied
+    //     the receive buffer, a write that takes fewer filled the send
+    //     buffer. With a poller that reports every arrival the next transfer
+    //     then waits for a newer report instead of calling the kernel only
+    //     to hit EAGAIN. (A datagram read is short without draining anything.)
+    enum class Kind : std::uint8_t {
+        Other,          // read/write
+        Pipe,           // read/write, byte stream
+        StreamSocket,   // recv/send, byte stream: TCP, Unix stream
+        DatagramSocket, // recv/send: UDP, Unix datagram
+    };
+    void setKind(Kind const kind) noexcept {
+        socket = kind == Kind::StreamSocket or kind == Kind::DatagramSocket;
+        byteStream = (kind == Kind::StreamSocket or kind == Kind::Pipe) and everyArrivalReported;
+    }
+    bool isSocket() const noexcept { return socket; }
 
     // For transfer loops (see Async.cpp), after reading `seen` and before
     // the system call: nothing can be there until a report newer than `seen`.
@@ -122,6 +135,7 @@ private:
     Poller &owner;
     int const descriptor;
     bool const everyArrivalReported;
+    bool socket = false;
     bool byteStream = false;
     std::error_code addError;
 

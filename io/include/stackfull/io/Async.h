@@ -36,6 +36,11 @@ using Deadline = std::chrono::steady_clock::time_point;
 // reports readiness. The descriptor must be O_NONBLOCK and registered.
 // The ...Until variants give up at `deadline` with std::errc::timed_out
 // (for writeAllUntil, after whatever was sent so far).
+//
+// Registration::setKind() picks the system calls: sockets use recv/send
+// (writes to a reset connection fail with EPIPE rather than raise SIGPIPE),
+// everything else read/write — where a write to a pipe without readers
+// still raises SIGPIPE unless the process ignores it.
 
 IoResult read(Registration &registration, void *buffer, std::size_t length);
 IoResult readUntil(Registration &registration, void *buffer, std::size_t length, Deadline deadline);

@@ -67,6 +67,17 @@ std::error_code openSocket(int const family, Fd &out) noexcept {
     return std::error_code{};
 }
 
+// Where send() has no MSG_NOSIGNAL, the socket itself is told not to raise
+// SIGPIPE if it can be.
+void suppressSigPipe(int const fd) noexcept {
+#if !defined(MSG_NOSIGNAL) && defined(SO_NOSIGPIPE)
+    int const one = 1;
+    ::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
+#else
+    static_cast<void>(fd);
+#endif
+}
+
 std::error_code enableNoDelay(int const fd, bool const enabled) noexcept {
     int const value = enabled ? 1 : 0;
     if (::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &value, sizeof value) != 0) {
@@ -106,11 +117,12 @@ TcpStreamResult TcpStream::connect(Poller &poller, SocketAddress const &address,
         return TcpStreamResult{nullptr, error};
     }
     enableNoDelay(socket.get(), true);
+    suppressSigPipe(socket.get());
     auto registration = std::make_unique<Registration>(poller, socket.get());
     if (registration->error()) {
         return TcpStreamResult{nullptr, registration->error()};
     }
-    registration->setByteStream(true);
+    registration->setKind(Registration::Kind::StreamSocket);
     std::error_code const error = deadline == Deadline::max()
                                       ? io::connect(*registration, address.get(), address.length)
                                       : io::connectUntil(*registration, address.get(), address.length, deadline);
@@ -127,11 +139,12 @@ TcpStreamResult TcpStream::adopt(Poller &poller, Fd socket) {
         return TcpStreamResult{nullptr, error};
     }
     enableNoDelay(socket.get(), true);
+    suppressSigPipe(socket.get());
     auto registration = std::make_unique<Registration>(poller, socket.get());
     if (registration->error()) {
         return TcpStreamResult{nullptr, registration->error()};
     }
-    registration->setByteStream(true);
+    registration->setKind(Registration::Kind::StreamSocket);
     return TcpStreamResult{std::unique_ptr<TcpStream>(new TcpStream(std::move(socket), std::move(registration))),
                            std::error_code{}};
 }
