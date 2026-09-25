@@ -110,6 +110,7 @@ TcpStreamResult TcpStream::connect(Poller &poller, SocketAddress const &address,
     if (registration->error()) {
         return TcpStreamResult{nullptr, registration->error()};
     }
+    registration->setByteStream(true);
     std::error_code const error = deadline == Deadline::max()
                                       ? io::connect(*registration, address.get(), address.length)
                                       : io::connectUntil(*registration, address.get(), address.length, deadline);
@@ -130,6 +131,7 @@ TcpStreamResult TcpStream::adopt(Poller &poller, Fd socket) {
     if (registration->error()) {
         return TcpStreamResult{nullptr, registration->error()};
     }
+    registration->setByteStream(true);
     return TcpStreamResult{std::unique_ptr<TcpStream>(new TcpStream(std::move(socket), std::move(registration))),
                            std::error_code{}};
 }

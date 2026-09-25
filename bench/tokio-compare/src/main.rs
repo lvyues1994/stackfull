@@ -381,6 +381,16 @@ fn echo_server(port: u16, workers: usize, lifetime: f64) {
     rt.spawn(accept_loop(listener, false));
     if lifetime > 0.0 {
         std::thread::sleep(Duration::from_secs_f64(lifetime));
+        let mut u: libc::rusage = unsafe { std::mem::zeroed() };
+        unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut u) };
+        let secs = |t: libc::timeval| t.tv_sec as f64 + 1e-6 * t.tv_usec as f64;
+        eprintln!(
+            "RUSAGE user {:.3} sys {:.3} voluntary {} involuntary {}",
+            secs(u.ru_utime),
+            secs(u.ru_stime),
+            u.ru_nvcsw,
+            u.ru_nivcsw
+        );
         std::process::exit(0);
     }
     loop {

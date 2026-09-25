@@ -6,7 +6,8 @@
 namespace stackfull {
 namespace io {
 
-Registration::Registration(Poller &poller_, int const fd_) noexcept : owner(poller_), descriptor(fd_) {
+Registration::Registration(Poller &poller_, int const fd_) noexcept
+    : owner(poller_), descriptor(fd_), everyArrivalReported(poller_.reportsEveryArrival()) {
     addError = owner.add(*this);
 }
 
@@ -99,9 +100,15 @@ void Registration::detach(Interest const direction, sync::detail::Waker const &w
     }
 }
 
-Registration::Wakeups Registration::collect(Interest const readyNow) noexcept {
+Registration::Wakeups Registration::collect(Interest const readyNow, Interest const closed) noexcept {
     Wakeups wakeups;
     sync::SpinLockGuard const guard(lock);
+    if (has(closed, Interest::Readable)) {
+        read.closed.store(true, std::memory_order_relaxed);
+    }
+    if (has(closed, Interest::Writable)) {
+        write.closed.store(true, std::memory_order_relaxed);
+    }
     if (has(readyNow, Interest::Readable)) {
         read.events.fetch_add(1, std::memory_order_acq_rel);
         wakeups.reader = read.waker;

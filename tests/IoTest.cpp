@@ -536,6 +536,124 @@ TEST_P(IoTest, WritevAllSendsEveryVector) {
     EXPECT_TRUE(inOrder);
 }
 
+namespace {
+
+// A plain blocking client socket connected to 127.0.0.1:port.
+Fd connectBlocking(std::uint16_t const port) {
+    Fd socket{::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0)};
+    SocketAddress const address = SocketAddress::loopback(port);
+    EXPECT_EQ(::connect(socket.get(), address.get(), address.length), 0);
+    return socket;
+}
+
+} // namespace
+
+// A short read leaves the stream exhausted; data arriving afterwards must
+// still be read (it brings a new report).
+TEST_P(IoTest, ShortReadWaitsForTheNextArrival) {
+    TcpListenerResult bound = TcpListener::bind(*poller, SocketAddress::loopback(0));
+    ASSERT_TRUE(bound);
+    TcpListener &listener = *bound.listener;
+    WaitGroup done;
+    done.add(1);
+    std::string first;
+    std::string second;
+    milliseconds waited{0};
+    ASSERT_TRUE(scheduler->spawn([&] {
+        TcpStreamResult peer = listener.accept();
+        EXPECT_TRUE(peer);
+        if (peer) {
+            char buffer[64];
+            IoResult got = peer.stream->read(buffer, sizeof buffer);
+            first.assign(buffer, got.bytes);
+            auto const start = std::chrono::steady_clock::now();
+            got = peer.stream->readFor(std::chrono::seconds{5}, buffer, sizeof buffer);
+            waited = std::chrono::duration_cast<milliseconds>(std::chrono::steady_clock::now() - start);
+            second.assign(buffer, got.bytes);
+        }
+        done.done();
+    }));
+    Fd client = connectBlocking(listener.port());
+    ASSERT_EQ(::write(client.get(), "abc", 3), 3);
+    std::this_thread::sleep_for(milliseconds{30});
+    ASSERT_EQ(::write(client.get(), "def", 3), 3);
+    done.wait();
+    EXPECT_EQ(first, "abc");
+    EXPECT_EQ(second, "def");
+    EXPECT_GE(waited.count(), 15);
+}
+
+// Data and the peer's FIN reported together: the short read of the data
+// must not make the next read wait for a report that will never come.
+TEST_P(IoTest, DataAndEndOfStreamArrivingTogetherAreBothRead) {
+    TcpListenerResult bound = TcpListener::bind(*poller, SocketAddress::loopback(0));
+    ASSERT_TRUE(bound);
+    TcpListener &listener = *bound.listener;
+    WaitGroup accepted;
+    accepted.add(1);
+    WaitGroup done;
+    done.add(1);
+    std::atomic<bool> sent{false};
+    std::string data;
+    IoResult end{99, std::error_code{}};
+    ASSERT_TRUE(scheduler->spawn([&] {
+        TcpStreamResult peer = listener.accept();
+        accepted.done();
+        EXPECT_TRUE(peer);
+        while (not sent.load()) {
+            this_task::sleepFor(milliseconds{1});
+        }
+        this_task::sleepFor(milliseconds{30}); // the poller sees data and FIN before we read
+        if (peer) {
+            char buffer[64];
+            IoResult const got = peer.stream->read(buffer, sizeof buffer);
+            data.assign(buffer, got.bytes);
+            end = peer.stream->readFor(std::chrono::seconds{2}, buffer, sizeof buffer);
+        }
+        done.done();
+    }));
+    Fd client = connectBlocking(listener.port());
+    accepted.wait();
+    ASSERT_EQ(::write(client.get(), "abc", 3), 3);
+    ASSERT_EQ(::shutdown(client.get(), SHUT_WR), 0);
+    sent.store(true);
+    done.wait();
+    EXPECT_EQ(data, "abc");
+    EXPECT_FALSE(end.error) << end.error.message();
+    EXPECT_EQ(end.bytes, 0u);
+}
+
+TEST_P(IoTest, PipeDataAndHangUpArrivingTogetherAreBothRead) {
+    int ends[2] = {-1, -1};
+    ASSERT_EQ(::pipe(ends), 0);
+    Fd readEnd{ends[0]};
+    Fd writeEnd{ends[1]};
+    ASSERT_FALSE(setNonBlocking(readEnd.get()));
+    ASSERT_EQ(::write(writeEnd.get(), "abc", 3), 3);
+    writeEnd.reset();
+    WaitGroup done;
+    done.add(1);
+    std::string data;
+    IoResult end{99, std::error_code{}};
+    ASSERT_TRUE(scheduler->spawn([&] {
+        {
+            Registration registration(*poller, readEnd.get());
+            registration.setByteStream(true);
+            this_task::sleepFor(milliseconds{30});
+            char buffer[64];
+            IoResult const got = io::read(registration, buffer, sizeof buffer);
+            data.assign(buffer, got.bytes);
+            end = io::readUntil(registration, buffer, sizeof buffer,
+                                std::chrono::steady_clock::now() + std::chrono::seconds{2});
+        }
+        done.done();
+    }));
+    done.wait();
+    EXPECT_EQ(data, "abc");
+    EXPECT_FALSE(end.error) << end.error.message();
+    EXPECT_EQ(end.bytes, 0u);
+}
+
 #if defined(__linux__)
 INSTANTIATE_TEST_SUITE_P(Backends, IoTest, ::testing::Values(Backend::Epoll, Backend::Poll), backendName);
 #else

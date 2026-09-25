@@ -35,6 +35,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -57,10 +58,17 @@ std::unique_ptr<Scheduler> makeNetScheduler(Poller &poller, std::size_t const wo
     return makeScheduler(options);
 }
 
-// Servers exit on their own after `lifetime` seconds (0: never).
+// Servers exit on their own after `lifetime` seconds (0: never), printing
+// the process's resource usage to stderr.
 [[noreturn]] void serveFor(double const lifetime) {
     if (lifetime > 0) {
         std::this_thread::sleep_for(std::chrono::duration<double>(lifetime));
+        rusage usage{};
+        ::getrusage(RUSAGE_SELF, &usage);
+        std::fprintf(stderr, "RUSAGE user %.3f sys %.3f voluntary %ld involuntary %ld\n",
+                     static_cast<double>(usage.ru_utime.tv_sec) + 1e-6 * static_cast<double>(usage.ru_utime.tv_usec),
+                     static_cast<double>(usage.ru_stime.tv_sec) + 1e-6 * static_cast<double>(usage.ru_stime.tv_usec),
+                     usage.ru_nvcsw, usage.ru_nivcsw);
         std::fflush(stdout);
         std::_Exit(0);
     }
@@ -240,6 +248,7 @@ int runClient(std::uint16_t const port, int const connections, std::size_t const
     std::atomic<int> connected{0};
     std::vector<std::vector<float>> latencies(static_cast<std::size_t>(connections));
     std::vector<long> trips(static_cast<std::size_t>(connections), 0);
+    std::atomic<long> allTrips{0}; // warm-up included: to divide the server's rusage by
     sync::WaitGroup done;
     done.add(static_cast<std::size_t>(connections));
     for (int c = 0; c < connections; ++c) {
@@ -256,11 +265,13 @@ int runClient(std::uint16_t const port, int const connections, std::size_t const
             std::vector<char> reply(bytes);
             connected.fetch_add(1);
             long count = 0;
+            long everything = 0;
             while (not stop.load(std::memory_order_relaxed)) {
                 auto const start = Clock::now();
                 if (not stream.writeAll(message.data(), bytes) or stream.readExactly(reply.data(), bytes).bytes != bytes) {
                     break;
                 }
+                ++everything;
                 if (counting.load(std::memory_order_relaxed)) {
                     auto const took = std::chrono::duration<float, std::micro>(Clock::now() - start).count();
                     mine.push_back(took);
@@ -268,6 +279,7 @@ int runClient(std::uint16_t const port, int const connections, std::size_t const
                 }
             }
             trips[static_cast<std::size_t>(c)] = count;
+            allTrips.fetch_add(everything);
             done.done();
         });
     }
@@ -293,6 +305,7 @@ int runClient(std::uint16_t const port, int const connections, std::size_t const
     std::snprintf(name, sizeof name, "%5d conns x %5zu B: %8.0f req/s ", connections, bytes,
                   static_cast<double>(total) / elapsed);
     printLatency(name, all);
+    std::printf("round trips in all: %ld\n", allTrips.load());
     scheduler->stop();
     return 0;
 }

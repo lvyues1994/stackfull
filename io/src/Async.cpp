@@ -33,15 +33,24 @@ std::uint32_t eventsOf(Registration const &registration, Interest const directio
     return direction == Interest::Readable ? registration.readEvents() : registration.writeEvents();
 }
 
-// Retries `transfer` (a read/write-like call returning ssize_t) until it
-// moves bytes, fails for real, or the deadline passes.
+// Retries `transfer` (a read/write-like call for up to `asked` bytes,
+// returning ssize_t) until it moves bytes, fails for real, or the deadline
+// passes. On a byte stream, a short transfer leaves the direction
+// exhausted: the next one waits for a newer report first.
 template <class Transfer>
-IoResult transferOnce(Registration &registration, Interest const direction, Deadline const *const deadline,
-                      Transfer const &transfer) {
+IoResult transferOnce(Registration &registration, Interest const direction, std::size_t const asked,
+                      Deadline const *const deadline, Transfer const &transfer) {
     for (;;) {
         std::uint32_t const seen = eventsOf(registration, direction);
+        if (registration.exhausted(direction, seen)) {
+            if (std::error_code const error = waitAgain(registration, direction, seen, deadline)) {
+                return IoResult{0, error};
+            }
+            continue;
+        }
         ssize_t const n = transfer();
         if (n >= 0) {
+            registration.noteTransfer(direction, seen, static_cast<std::size_t>(n), asked);
             return IoResult{static_cast<std::size_t>(n), std::error_code{}};
         }
         if (errno == EINTR) {
@@ -58,14 +67,22 @@ IoResult transferOnce(Registration &registration, Interest const direction, Dead
 
 IoResult readImpl(Registration &registration, void *const buffer, std::size_t const length,
                   Deadline const *const deadline) {
-    return transferOnce(registration, Interest::Readable, deadline,
+    return transferOnce(registration, Interest::Readable, length, deadline,
                         [&] { return ::read(registration.fd(), buffer, length); });
 }
 
 IoResult writeImpl(Registration &registration, void const *const buffer, std::size_t const length,
                    Deadline const *const deadline) {
-    return transferOnce(registration, Interest::Writable, deadline,
+    return transferOnce(registration, Interest::Writable, length, deadline,
                         [&] { return ::write(registration.fd(), buffer, length); });
+}
+
+std::size_t totalLength(iovec const *const vectors, int const count) noexcept {
+    std::size_t total = 0;
+    for (int i = 0; i < count; ++i) {
+        total += vectors[i].iov_len;
+    }
+    return total;
 }
 
 IoResult writeAllImpl(Registration &registration, void const *const buffer, std::size_t const length,
@@ -178,12 +195,12 @@ IoResult readExactly(Registration &registration, void *const buffer, std::size_t
 }
 
 IoResult readv(Registration &registration, iovec const *const vectors, int const count) {
-    return transferOnce(registration, Interest::Readable, nullptr,
+    return transferOnce(registration, Interest::Readable, totalLength(vectors, count), nullptr,
                         [&] { return ::readv(registration.fd(), vectors, count); });
 }
 
 IoResult writev(Registration &registration, iovec const *const vectors, int const count) {
-    return transferOnce(registration, Interest::Writable, nullptr,
+    return transferOnce(registration, Interest::Writable, totalLength(vectors, count), nullptr,
                         [&] { return ::writev(registration.fd(), vectors, count); });
 }
 

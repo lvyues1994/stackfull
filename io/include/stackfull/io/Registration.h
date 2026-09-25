@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <system_error>
 
@@ -61,9 +62,33 @@ struct Registration {
     std::error_code waitReadable();
     std::error_code waitWritable();
 
+    // Byte-stream descriptors (TCP and Unix stream sockets, pipes): a read
+    // that returns fewer bytes than asked emptied the receive buffer, a
+    // write that takes fewer filled the send buffer. With a poller that
+    // reports every arrival, the next transfer then waits for a newer report
+    // instead of calling the kernel only to hit EAGAIN. Off by default: a
+    // datagram read is short without draining anything.
+    void setByteStream(bool const enabled) noexcept { byteStream = enabled and everyArrivalReported; }
+
+    // For transfer loops (see Async.cpp), after reading `seen` and before
+    // the system call: nothing can be there until a report newer than `seen`.
+    bool exhausted(Interest const direction, std::uint32_t const seen) const noexcept {
+        Direction const &mine = slot(direction);
+        return mine.exhausted and mine.exhaustedAt == seen and not mine.closed.load(std::memory_order_relaxed);
+    }
+    // After a transfer that moved `bytes` of the `asked`.
+    void noteTransfer(Interest const direction, std::uint32_t const seen, std::size_t const bytes,
+                      std::size_t const asked) noexcept {
+        Direction &mine = slot(direction);
+        mine.exhausted = byteStream and bytes != 0 and bytes < asked;
+        mine.exhaustedAt = seen;
+    }
+
     // --- for Poller implementations ----------------------------------------
     // Record readiness and take the waiters to wake; call wake() after
-    // releasing the poller's own locks.
+    // releasing the poller's own locks. `closed` marks directions the peer
+    // or an error ended for good (hang-up, read side shut down): transfers
+    // there are never skipped again, since no further report may come.
     struct Wakeups {
         sync::detail::Waker reader;
         sync::detail::Waker writer;
@@ -72,22 +97,32 @@ struct Registration {
             writer.wake();
         }
     };
-    Wakeups collect(Interest ready) noexcept;
-    void deliver(Interest ready) noexcept { collect(ready).wake(); }
+    Wakeups collect(Interest ready, Interest closed = Interest::None) noexcept;
+    void deliver(Interest ready, Interest closed = Interest::None) noexcept { collect(ready, closed).wake(); }
 
 private:
     struct Direction {
         std::atomic<std::uint32_t> events{0};
         std::uint32_t consumed = 0; // for the uncounted waits
         sync::detail::Waker waker;
+        // Stored before the count is bumped, so a reader of the count sees it.
+        std::atomic<bool> closed{false};
+        // Owned by the one party transferring in this direction.
+        bool exhausted = false;
+        std::uint32_t exhaustedAt = 0;
     };
 
     std::error_code waitFor(Interest direction, std::uint32_t seen, bool hasDeadline, TimePoint deadline);
     Direction &slot(Interest const direction) noexcept { return direction == Interest::Readable ? read : write; }
+    Direction const &slot(Interest const direction) const noexcept {
+        return direction == Interest::Readable ? read : write;
+    }
     void detach(Interest direction, sync::detail::Waker const &waker) noexcept;
 
     Poller &owner;
     int const descriptor;
+    bool const everyArrivalReported;
+    bool byteStream = false;
     std::error_code addError;
 
     sync::SpinLock lock;

@@ -156,7 +156,10 @@ private:
                 table[index].events = static_cast<short>(table[index].events & ~POLLOUT);
             }
             if (watched != 0) {
-                pending.push_back(table[index].registration->collect(ready));
+                Interest const closed = (item.revents & (POLLHUP | POLLERR | POLLNVAL)) != 0
+                                            ? Interest::Readable | Interest::Writable
+                                            : Interest::None;
+                pending.push_back(table[index].registration->collect(ready, closed));
             }
         }
     }

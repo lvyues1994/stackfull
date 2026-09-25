@@ -43,6 +43,9 @@ struct Poller : sched::Driver {
     virtual void remove(Registration &registration) noexcept = 0;
     // Called before each wait with the directions someone waits on.
     virtual std::error_code arm(Registration &registration, Interest interest) noexcept = 0;
+    // True if every arrival of data (or buffer space) is reported, even
+    // while the previous report has not been acted on: edge triggering.
+    virtual bool reportsEveryArrival() const noexcept { return false; }
 };
 
 #if defined(__linux__)

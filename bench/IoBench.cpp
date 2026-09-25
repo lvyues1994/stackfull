@@ -52,6 +52,7 @@ void benchEchoRoundTrip(char const *const name, std::unique_ptr<Poller> poller, 
         Registration acceptor(*poller, listener.fd.get());
         AcceptResult client = io::accept(acceptor);
         Registration connection(*poller, client.fd.get());
+        connection.setByteStream(true);
         char byte = 0;
         for (long i = 0; i < rounds; ++i) {
             if (io::readExactly(connection, &byte, 1).bytes != 1) {
@@ -64,6 +65,7 @@ void benchEchoRoundTrip(char const *const name, std::unique_ptr<Poller> poller, 
     scheduler->spawn([&] {
         TcpSocketResult socket = makeTcpSocket();
         Registration connection(*poller, socket.fd.get());
+        connection.setByteStream(true);
         sockaddr_in const address = loopbackAddress(port);
         io::connect(connection, reinterpret_cast<sockaddr const *>(&address), sizeof address);
         char byte = 'x';

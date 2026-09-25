@@ -81,6 +81,8 @@ struct EpollPoller final : Poller {
         return std::error_code{}; // edge-triggered: always watching
     }
 
+    bool reportsEveryArrival() const noexcept override { return true; }
+
     void wait(std::chrono::nanoseconds const timeout) override {
         int millis = -1;
         if (timeout >= std::chrono::nanoseconds{0}) {
@@ -111,7 +113,7 @@ struct EpollPoller final : Poller {
                     continue;
                 }
                 if (Registration *const registration = table[static_cast<std::size_t>(fd)]) {
-                    wakeups[taken++] = registration->collect(readyOf(events[i].events));
+                    wakeups[taken++] = registration->collect(readyOf(events[i].events), closedOf(events[i].events));
                 }
             }
         }
@@ -138,6 +140,17 @@ private:
             ready = ready | Interest::Writable;
         }
         return ready;
+    }
+
+    static Interest closedOf(std::uint32_t const events) noexcept {
+        Interest closed = Interest::None;
+        if ((events & (EPOLLRDHUP | EPOLLHUP | EPOLLERR)) != 0) {
+            closed = closed | Interest::Readable;
+        }
+        if ((events & (EPOLLHUP | EPOLLERR)) != 0) {
+            closed = closed | Interest::Writable;
+        }
+        return closed;
     }
 
     Fd epollFd;
