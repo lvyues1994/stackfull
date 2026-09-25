@@ -1,9 +1,14 @@
 // Tokio counterparts of bench/ScaleBench.cpp (scale, mem, lat), of the
-// Channel cases in bench/SyncBench.cpp (chan) and of bench/CpuBench.cpp (cpu).
+// Channel cases in bench/SyncBench.cpp (chan), of bench/CpuBench.cpp (cpu)
+// and of the server side of bench/NetBench.cpp (echo-server, hol).
 //
 //   cargo run --release -- [scale|mem|lat|chan|cpu|all]
+//   cargo run --release -- echo-server <port> <workers> [lifetime-seconds]
+//   cargo run --release -- hol <workers>
+use std::io::{Read as _, Write as _};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering::*};
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Notify;
 
 fn rt(n: usize) -> tokio::runtime::Runtime {
@@ -343,8 +348,95 @@ fn cpu_trickle(workers: usize, period: Duration) {
     producer.join().unwrap();
 }
 
+// ---- network: echo server and head-of-line case (NetBench.cpp) --------------
+async fn echo(mut stream: tokio::net::TcpStream, heavy: bool) {
+    let mut buf = vec![0u8; 16384];
+    loop {
+        let n = match stream.read(&mut buf).await {
+            Ok(0) | Err(_) => return,
+            Ok(n) => n,
+        };
+        if heavy && buf[0] == b'H' {
+            let until = Instant::now() + Duration::from_millis(20);
+            while Instant::now() < until {}
+        }
+        if stream.write_all(&buf[..n]).await.is_err() {
+            return;
+        }
+    }
+}
+
+async fn accept_loop(listener: tokio::net::TcpListener, heavy: bool) {
+    loop {
+        let (stream, _) = listener.accept().await.unwrap();
+        stream.set_nodelay(true).unwrap();
+        tokio::spawn(echo(stream, heavy));
+    }
+}
+
+// Exits on its own after `lifetime` seconds (0: never).
+fn echo_server(port: u16, workers: usize, lifetime: f64) {
+    let rt = rt(workers);
+    let listener = rt.block_on(tokio::net::TcpListener::bind(("0.0.0.0", port))).unwrap();
+    rt.spawn(accept_loop(listener, false));
+    if lifetime > 0.0 {
+        std::thread::sleep(Duration::from_secs_f64(lifetime));
+        std::process::exit(0);
+    }
+    loop {
+        std::thread::sleep(Duration::from_secs(3600));
+    }
+}
+
+fn round_trip(s: &mut std::net::TcpStream, request: u8) -> bool {
+    let mut reply = [0u8; 1];
+    s.write_all(&[request]).is_ok() && s.read_exact(&mut reply).is_ok()
+}
+
+fn head_of_line(workers: usize) {
+    let rt = rt(workers);
+    let listener = rt.block_on(tokio::net::TcpListener::bind("127.0.0.1:0")).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    rt.spawn(accept_loop(listener, true));
+    let stop = leak(AtomicBool::new(false));
+    let heavy = std::thread::spawn(move || {
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_nodelay(true).unwrap();
+        while !stop.load(Relaxed) && round_trip(&mut s, b'H') {}
+    });
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_nodelay(true).unwrap();
+    let mut lat = vec![];
+    let mut next = Instant::now();
+    let end = next + Duration::from_secs(3);
+    while Instant::now() < end {
+        next += Duration::from_millis(1);
+        std::thread::sleep(next.saturating_duration_since(Instant::now()));
+        let t0 = Instant::now();
+        if !round_trip(&mut s, b'L') {
+            break;
+        }
+        lat.push(t0.elapsed().as_nanos() as f64 / 1000.0);
+    }
+    stop.store(true, Relaxed);
+    heavy.join().unwrap();
+    let slow = lat.iter().filter(|&&v| v > 1000.0).count();
+    println!(">1ms {:.1}%", 100.0 * slow as f64 / lat.len() as f64);
+    report(&format!("light pings next to a 20 ms handler, {}w", workers), lat);
+    std::process::exit(0);
+}
+
 fn main() {
     let what = std::env::args().nth(1).unwrap_or_else(|| "all".into());
+    let arg = |i: usize, fallback: &str| std::env::args().nth(i).unwrap_or_else(|| fallback.into());
+    if what == "echo-server" {
+        echo_server(arg(2, "9000").parse().unwrap(), arg(3, "4").parse().unwrap(), arg(4, "0").parse().unwrap());
+        return;
+    }
+    if what == "hol" {
+        head_of_line(arg(2, "4").parse().unwrap());
+        return;
+    }
     let ns = [1usize, 2, 4, 8, 16, 24];
     if what == "all" || what == "scale" {
         for &n in &ns {
