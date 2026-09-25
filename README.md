@@ -6,9 +6,11 @@
 
 ```
 ┌───────────────────────────────────────────────────────────┐
-│ runtime         defaultScheduler · go · async · blockOn       │  ✔
+│ runtime         defaultScheduler · go · async · blockOn ·     │  ✔
+│                 blocking · resolve · connectTcp               │
 ├───────────────────────────────────────────────────────────┤
-│ L4b io          Poller(Driver) epoll/poll · 定时器 · fd 包装   │  ✔
+│ L4b io          Poller(Driver) epoll/poll · 定时器 ·          │  ✔
+│                 TCP · Unix 域 · UDP · BufReader/Writer · DNS  │
 ├───────────────────────────────────────────────────────────┤
 │ L4a sync        Semaphore · Mutex · CondVar · WaitGroup ·     │  ✔
 │                 Channel<T>（任务与普通线程都能用）              │
@@ -275,10 +277,35 @@ int main() {
 }
 ```
 
-- `TcpStream` / `TcpListener` 拥有 fd 和它的 `Registration`，析构时先从 Poller 摘除、再关闭 fd；`Poller` 显式传入——它必须是某个运行中的调度器在轮询的那个。自建调度器时 `options.driver = poller.get()`，再把同一个 poller 传给 IO 对象；默认调度器用 `defaultPoller()`。
-- 带超时的版本：`readFor/readUntil`、`acceptFor/acceptUntil`、`TcpStream::connect(poller, addr, deadline)`、`writeAllUntil`，超时返回 `std::errc::timed_out`，流仍可继续使用。`writevAll` 做聚集写；`BufWriter` 把小写入攒起来，一次 `writev` 连同放不下的负载一起发出。
-- 底层接口仍在：`io::Registration` + `io::read/write/accept/connect/readv/writev`，用于自定义 fd。
+```cpp
+// 按名字连接（getaddrinfo 在阻塞线程池里跑，worker 不被占住），按行读回应
+io::TcpStreamResult conn = connectTcp("example.com", 80, std::chrono::steady_clock::now() + std::chrono::seconds{5});
+if (not conn) return;
+io::BufWriter out(*conn.stream);
+out.write(request.data(), request.size());
+out.flush();
+io::BufReader in(*conn.stream);
+for (std::string line; in.readLine(line).bytes > 0 and line != "\r\n"; line.clear()) { /* 一个头部行 */ }
+
+// UDP：一次系统调用收一批
+auto udp = io::UdpSocket::bind(defaultPoller(), io::SocketAddress::any(5353));
+char buffers[32][1500];
+io::Datagram batch[32];
+for (int i = 0; i < 32; ++i) { batch[i].data = buffers[i]; batch[i].capacity = sizeof buffers[i]; }
+io::BatchResult got = udp.socket->recvMany(batch, 32);   // 至少等到一个，再把已排队的一起取走
+```
+
+- `TcpStream` / `UnixStream` / `TcpListener` / `UnixListener` / `UdpSocket` 拥有 fd 和它的 `Registration`，析构时先从 Poller 摘除、再关闭 fd；`Poller` 显式传入——它必须是某个运行中的调度器在轮询的那个。自建调度器时 `options.driver = poller.get()`，再把同一个 poller 传给 IO 对象；默认调度器用 `defaultPoller()`。
+- `io::StreamSocket` 是 `TcpStream` 与 `UnixStream` 的公共基类：读写、超时、`shutdownWrite`、本端/对端地址。协议代码接受 `StreamSocket&`，就能同时跑在 TCP 和 Unix 域套接字上。Unix 域：`UnixStream::connect` / `pair()`、`UnixListener::bind`，地址用 `SocketAddress::unixPath(path, out)`，Linux/Android 另有 `unixAbstract(name, out)`（抽象命名空间，不留文件）。
+- 带超时的版本：`readFor/readUntil`、`acceptFor/acceptUntil`、`connect(poller, addr, deadline)`、`writeAllUntil`、`recvFor/recvFromFor/recvManyUntil`，超时返回 `std::errc::timed_out`，对象仍可继续使用。`writevAll` 做聚集写。
+- `BufWriter` 把小写入攒起来，一次 `writev` 连同放不下的负载一起发出。`BufReader` 每次补满缓冲只读一次：`readLine`（分隔符可选，超过长度上限报 `message_size`）、`readExactly`、`read` 都可带截止时间；`fill()/data()/consume()` 用来自己分帧。
+- `UdpSocket::bind` 是服务端形态（`recvFrom/sendTo`），`UdpSocket::connect` 是客户端形态（`send/recv`，其他来源的数据报由内核过滤）。`recvMany/sendMany` 在 Linux/Android 上走 `recvmmsg/sendmmsg`（每次系统调用最多 64 个，没有这两个调用的平台逐个收发），截断按数据报报告；单个 `recv` 截断时丢掉超出部分。
+- 名字解析：`io::resolve(host, port)` 同步调用 `getaddrinfo`（数字地址不查询，错误码在 `io::resolveCategory()`）。任务里用 `stackfull::resolve()`（放到阻塞线程池）或 `connectTcp(host, port, deadline)`（解析后按顺序尝试每个地址）；`TcpStream::connect` 本身也接受地址列表。
+- `TcpListenOptions::reusePort`：多个监听者共用一个端口（`SO_REUSEPORT`），由内核分摊连接。
+- 套接字用 `recv/send` 读写，而不是 `read/write`：后者每次调用都要过 VFS 的文件权限钩子（这台机器上是 AppArmor，Android 上是 SELinux），换掉后单核回显吞吐 +11%。发送带 `MSG_NOSIGNAL`：向已被对端重置的连接写返回 `EPIPE`，不会触发 SIGPIPE 杀掉进程（没有 `MSG_NOSIGNAL` 的平台改设 `SO_NOSIGPIPE`）。
+- 底层接口仍在：`io::Registration` + `io::read/write/accept/connect/readv/writev`，用于自定义 fd；`Registration::setKind()` 声明描述符类型（`StreamSocket` / `DatagramSocket` / `Pipe` / `Other`），决定用哪组系统调用、是否按字节流处理。`io::callWhenReady(registration, direction, asked, deadline, call)` 就是这些读写背后的计数等待循环，其他非阻塞系统调用也可以套用。
 - **epoll 边沿触发**：fd 在 `add` 时一次注册读写两个方向，等待不调用 `epoll_ctl`；echo 往返的成功路径零 `epoll_ctl`。就绪按方向计数：操作在系统调用**之前**取计数快照，`EAGAIN` 后等待比快照新的报告，系统调用与等待之间到达的边沿不会丢。`poll` 后端（QNX）仍是一次性 arm，同一套计数协议成立。
+- **字节流的短读短写**：读到的字节少于请求，说明接收缓冲已读空；写进去的少于请求，说明发送缓冲已满。边沿触发下之后每次到达都会再报告，所以下一次直接等新报告，省掉那次必然 `EAGAIN` 的系统调用（Tokio 同样的做法），回显吞吐 +10%。对端关闭和出错按粘滞状态记下：数据和 FIN 一起到达时，读完数据不会因为跳过而漏掉 EOF。`poll` 后端是水平触发，不做这个跳过。
 - **timekeeper**：任一时刻只有一个空闲 worker 以最早的定时器为超时睡在 `Driver::wait()`（有 Driver 时即 `epoll_wait`）里，并负责触发到期定时器；其他空闲 worker 睡自己的 futex。忙碌的 worker 每 61 次分派做一次维护：触发到期定时器并对 Driver 做一次非阻塞轮询，所以全忙时 IO 也不会饿死。
 - 分派在表锁下一趟收集整批事件的等待者、解锁后再唤醒；事件携带 fd 号而非指针，`Registration` 析构后的迟到事件只会查不到。等待者按值记为 `Waker`，从不指向等待方的栈。
 - `Scheduler::stop()` 的 `ForcedUnwind` 会穿过所有阻塞点，每个 park 点都有摘除守卫。任何包含 `park()` 的函数都不能是 `noexcept`。
@@ -347,6 +374,24 @@ gcc 13 -O3；Android 列为小米 25091RP04C（arm64，8 核，Android 16）上 
 
 Tokio 的 `yield_now` 会把任务推迟到本轮之后，语义不同。
 
+### 网络服务端对照
+
+`bench/NetBench.cpp` 有三种回显服务端：stackfull（每连接一个任务）、裸 epoll（每核一个线程、各自的 `SO_REUSEPORT` 监听、回调里回显，作为手写代码的上限）和 `bench/tokio-compare` 里的 Tokio 版，用同一个压测客户端。`bench/net-compare.sh` 把服务端和客户端绑在不同的 P 核上，服务端每请求 CPU 取自它退出时的 `getrusage`。回环网络，各 3 轮取中位数：
+
+| 负载 | stackfull | 裸 epoll | Tokio |
+|---|---|---|---|
+| 256 连接 × 64 B 乒乓，服务端 1 核 | 541k req/s | 598k | 564k |
+| 同上，服务端 2 核 | 934k | 1088k | 1025k |
+| 同上，服务端 4 核 | 1350k | 1412k | 1311k |
+| 单连接乒乓延迟 p50 / p99 | 5.6 / 7.5 µs | 5.4 / 7.1 µs | 5.5 / 6.7 µs |
+| 单连接 64 KiB 块经回显的吞吐 | 4.8–6.7 GB/s | 4.1–5.2 GB/s | 4.9–5.7 GB/s |
+| 短连接（建连、一次往返、关闭），服务端每连接 CPU | 约 14.5 µs | 约 10.5 µs | 约 11–13 µs |
+
+- 这一轮之前，1 核是 380–440k、2 核 780–800k（只有 Tokio 的 75%）。提升来自两处：字节流短读短写后跳过必然 `EAGAIN` 的调用（+10%），套接字改用 `recv/send`（+11%）。同时试过把每次 `epoll_wait` 的事件数从 64 提到 1024、每次等待少拿一次锁，都在噪声之内。
+- 2 核还差 Tokio 约 9%，每请求多 0.1 µs 用户态：IO 事件都由持有轮询角色的那个 worker 收取，另一个 worker 靠窃取分到活，约每 6 个请求一次；有栈任务换核要把栈上的热数据一起搬过去，比迁移一个小 future 贵。
+- 短连接的吞吐三者都停在约 2.5 万连接/秒，这是客户端向同一目标端口复用临时端口的上限（TIME_WAIT 端口要过 1 秒才能复用），不是服务端的瓶颈；表中比的是服务端为此花的 CPU，stackfull 多出的部分主要是连接之间 worker 反复空转、睡下再被唤醒。
+- 这台机器上同一个用例在不同轮次之间常分成两簇，相差 10–15%（服务端版本不变也一样）；只有交替运行的 A/B 才能比较版本。
+
 ### 空闲与稀疏负载的 CPU 占用
 
 `bench/CpuBench.cpp`（`stackfull_cpu_bench [每个用例秒数] [用例名子串]`）按线程读 `/proc/self/task/*/schedstat`，排除外部生产者线程，只算调度器自己；“裸线程”是同样事件落在一个 `std::thread` 上的下限。x86_64 为 24 核、24 个 worker，Android 为上面那台手机、8 个 worker，百分比为占一个核：
@@ -382,6 +427,9 @@ Tokio 的 `yield_now` 会把任务推迟到本轮之后，语义不同。
 IO 与定时器：
 
 - `Registration` 必须在 fd 关闭之前析构（声明顺序：先 `Fd`、后 `Registration`）。
+- 被 IO 唤醒的任务如果长时间占着 CPU，在它结束或 park 之前，其他连接的就绪事件可能没人收取：收到事件的 worker 自己跑第一个任务，轮询角色空出来，而其余空闲 worker 睡在各自的 futex 上，不会顶上去轮询（Tokio 同样如此）。实测一个每请求空转 20 ms 的处理函数旁边，另一条连接约 3.5% 的请求要等它跑完（Tokio 3.8%）。长计算交给 `blocking()`。
+- 管道仍用 `write`：写一个没有读端的管道会触发 SIGPIPE，需要进程自己忽略该信号。
+- Unix 域 `connect` 遇到监听方积压队列已满时返回 `resource_unavailable_try_again`，连接并未排队，稍后重试。
 - `ConditionVariable::wait` 被强制展开时只能 `tryLock` 尽力重新持锁；持锁方若也在被回收则互斥量状态未定义——这只发生在 `stop()`。
 - `sleepFor` 只能在任务内调用；1 个 worker 且任务从不 `yield` 时定时器无法触发（协作式无抢占）。
 
