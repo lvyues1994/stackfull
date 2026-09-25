@@ -3,6 +3,8 @@
 #include <stackfull/io/Poller.h>
 #include <stackfull/sched/Scheduler.h>
 
+#include <string>
+
 namespace stackfull {
 
 namespace {
@@ -31,6 +33,24 @@ sched::Scheduler &defaultScheduler() {
 
 io::Poller &defaultPoller() {
     return *defaultRuntime().poller;
+}
+
+io::ResolveResult resolve(char const *const host, std::uint16_t const port, int const family) {
+    io::SocketAddress numeric;
+    if (io::SocketAddress::parse(host, port, numeric)) {
+        return io::resolve(host, port, family);
+    }
+    // By value: a task unwound at stop() leaves the job running without it.
+    std::string const name(host);
+    return blocking([name, port, family] { return io::resolve(name.c_str(), port, family); });
+}
+
+io::TcpStreamResult connectTcp(char const *const host, std::uint16_t const port, io::Deadline const deadline) {
+    io::ResolveResult const resolved = resolve(host, port);
+    if (not resolved) {
+        return io::TcpStreamResult{nullptr, resolved.error};
+    }
+    return io::TcpStream::connect(defaultPoller(), resolved.addresses, deadline);
 }
 
 } // namespace stackfull

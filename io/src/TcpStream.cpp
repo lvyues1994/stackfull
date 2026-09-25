@@ -1,82 +1,17 @@
 #include <stackfull/io/TcpStream.h>
 
-#include <cstring>
+#include "Socket.h"
+
 #include <utility>
 
-#include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
-#include <unistd.h>
 
 namespace stackfull {
 namespace io {
 
-// --- SocketAddress -------------------------------------------------------------
-
-bool SocketAddress::parse(char const *const host, std::uint16_t const port, SocketAddress &out) noexcept {
-    SocketAddress result;
-    auto *const v4 = reinterpret_cast<sockaddr_in *>(&result.storage);
-    if (::inet_pton(AF_INET, host, &v4->sin_addr) == 1) {
-        v4->sin_family = AF_INET;
-        v4->sin_port = htons(port);
-        result.length = sizeof(sockaddr_in);
-        out = result;
-        return true;
-    }
-    auto *const v6 = reinterpret_cast<sockaddr_in6 *>(&result.storage);
-    if (::inet_pton(AF_INET6, host, &v6->sin6_addr) == 1) {
-        v6->sin6_family = AF_INET6;
-        v6->sin6_port = htons(port);
-        result.length = sizeof(sockaddr_in6);
-        out = result;
-        return true;
-    }
-    return false;
-}
-
 namespace {
-
-SocketAddress ipv4(std::uint32_t const hostOrder, std::uint16_t const port) noexcept {
-    SocketAddress result;
-    auto *const v4 = reinterpret_cast<sockaddr_in *>(&result.storage);
-    v4->sin_family = AF_INET;
-    v4->sin_port = htons(port);
-    v4->sin_addr.s_addr = htonl(hostOrder);
-    result.length = sizeof(sockaddr_in);
-    return result;
-}
-
-// Non-blocking, close-on-exec TCP socket for `family`.
-std::error_code openSocket(int const family, Fd &out) noexcept {
-#if defined(SOCK_NONBLOCK) && defined(SOCK_CLOEXEC)
-    Fd socket{::socket(family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0)};
-    if (not socket) {
-        return lastError();
-    }
-#else
-    Fd socket{::socket(family, SOCK_STREAM, 0)};
-    if (not socket) {
-        return lastError();
-    }
-    if (std::error_code const error = setNonBlocking(socket.get())) {
-        return error;
-    }
-#endif
-    out = std::move(socket);
-    return std::error_code{};
-}
-
-// Where send() has no MSG_NOSIGNAL, the socket itself is told not to raise
-// SIGPIPE if it can be.
-void suppressSigPipe(int const fd) noexcept {
-#if !defined(MSG_NOSIGNAL) && defined(SO_NOSIGPIPE)
-    int const one = 1;
-    ::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
-#else
-    static_cast<void>(fd);
-#endif
-}
 
 std::error_code enableNoDelay(int const fd, bool const enabled) noexcept {
     int const value = enabled ? 1 : 0;
@@ -88,150 +23,102 @@ std::error_code enableNoDelay(int const fd, bool const enabled) noexcept {
 
 } // namespace
 
-SocketAddress SocketAddress::loopback(std::uint16_t const port) noexcept {
-    return ipv4(INADDR_LOOPBACK, port);
-}
-
-SocketAddress SocketAddress::any(std::uint16_t const port) noexcept {
-    return ipv4(INADDR_ANY, port);
-}
-
-std::uint16_t SocketAddress::port() const noexcept {
-    if (storage.ss_family == AF_INET) {
-        return ntohs(reinterpret_cast<sockaddr_in const *>(&storage)->sin_port);
-    }
-    if (storage.ss_family == AF_INET6) {
-        return ntohs(reinterpret_cast<sockaddr_in6 const *>(&storage)->sin6_port);
-    }
-    return 0;
-}
-
 // --- TcpStream -------------------------------------------------------------------
 
-TcpStream::TcpStream(Fd socket_, std::unique_ptr<Registration> registration_) noexcept
-    : socket(std::move(socket_)), registration(std::move(registration_)) {}
+TcpStreamResult TcpStream::wrap(Poller &poller, Fd socket) {
+    detail::suppressSigPipe(socket.get());
+    enableNoDelay(socket.get(), true);
+    std::unique_ptr<TcpStream> stream(new TcpStream(poller, std::move(socket)));
+    if (std::error_code const error = stream->events().error()) {
+        return TcpStreamResult{nullptr, error};
+    }
+    return TcpStreamResult{std::move(stream), std::error_code{}};
+}
 
 TcpStreamResult TcpStream::connect(Poller &poller, SocketAddress const &address, Deadline const deadline) {
     Fd socket;
-    if (std::error_code const error = openSocket(address.family(), socket)) {
+    if (std::error_code const error = detail::openSocket(address.family(), SOCK_STREAM, socket)) {
         return TcpStreamResult{nullptr, error};
     }
-    enableNoDelay(socket.get(), true);
-    suppressSigPipe(socket.get());
-    auto registration = std::make_unique<Registration>(poller, socket.get());
-    if (registration->error()) {
-        return TcpStreamResult{nullptr, registration->error()};
+    TcpStreamResult result = wrap(poller, std::move(socket));
+    if (not result) {
+        return result;
     }
-    registration->setKind(Registration::Kind::StreamSocket);
+    Registration &registration = result.stream->events();
     std::error_code const error = deadline == Deadline::max()
-                                      ? io::connect(*registration, address.get(), address.length)
-                                      : io::connectUntil(*registration, address.get(), address.length, deadline);
+                                      ? io::connect(registration, address.get(), address.length)
+                                      : io::connectUntil(registration, address.get(), address.length, deadline);
     if (error) {
-        registration.reset(); // before the socket closes
         return TcpStreamResult{nullptr, error};
     }
-    return TcpStreamResult{std::unique_ptr<TcpStream>(new TcpStream(std::move(socket), std::move(registration))),
-                           std::error_code{}};
+    return result;
+}
+
+TcpStreamResult TcpStream::connect(Poller &poller, std::vector<SocketAddress> const &addresses,
+                                   Deadline const deadline) {
+    TcpStreamResult result{nullptr, std::make_error_code(std::errc::address_not_available)};
+    for (SocketAddress const &address : addresses) {
+        result = connect(poller, address, deadline);
+        if (result or result.error == std::errc::timed_out) {
+            break;
+        }
+    }
+    return result;
 }
 
 TcpStreamResult TcpStream::adopt(Poller &poller, Fd socket) {
     if (std::error_code const error = setNonBlocking(socket.get())) {
         return TcpStreamResult{nullptr, error};
     }
-    enableNoDelay(socket.get(), true);
-    suppressSigPipe(socket.get());
-    auto registration = std::make_unique<Registration>(poller, socket.get());
-    if (registration->error()) {
-        return TcpStreamResult{nullptr, registration->error()};
-    }
-    registration->setKind(Registration::Kind::StreamSocket);
-    return TcpStreamResult{std::unique_ptr<TcpStream>(new TcpStream(std::move(socket), std::move(registration))),
-                           std::error_code{}};
+    return wrap(poller, std::move(socket));
 }
 
 std::error_code TcpStream::setNoDelay(bool const enabled) noexcept {
-    return enableNoDelay(socket.get(), enabled);
-}
-
-std::error_code TcpStream::shutdownWrite() noexcept {
-    if (::shutdown(socket.get(), SHUT_WR) != 0) {
-        return lastError();
-    }
-    return std::error_code{};
+    return enableNoDelay(fd(), enabled);
 }
 
 // --- TcpListener -----------------------------------------------------------------
 
-TcpListener::TcpListener(Poller &poller_, Fd socket_, std::unique_ptr<Registration> registration_,
-                         SocketAddress const &local_) noexcept
-    : poller(poller_), socket(std::move(socket_)), registration(std::move(registration_)), local(local_) {}
-
 TcpListenerResult TcpListener::bind(Poller &poller, SocketAddress const &address, int const backlog) {
+    TcpListenOptions options;
+    options.backlog = backlog;
+    return bind(poller, address, options);
+}
+
+TcpListenerResult TcpListener::bind(Poller &poller, SocketAddress const &address, TcpListenOptions const &options) {
     Fd socket;
-    if (std::error_code const error = openSocket(address.family(), socket)) {
+    if (std::error_code const error = detail::openSocket(address.family(), SOCK_STREAM, socket)) {
         return TcpListenerResult{nullptr, error};
     }
     int const one = 1;
     ::setsockopt(socket.get(), SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
-    if (::bind(socket.get(), address.get(), address.length) != 0 or ::listen(socket.get(), backlog) != 0) {
-        return TcpListenerResult{nullptr, lastError()};
+    if (options.reusePort) {
+#if defined(SO_REUSEPORT)
+        if (::setsockopt(socket.get(), SOL_SOCKET, SO_REUSEPORT, &one, sizeof one) != 0) {
+            return TcpListenerResult{nullptr, lastError()};
+        }
+#else
+        return TcpListenerResult{nullptr, std::make_error_code(std::errc::function_not_supported)};
+#endif
     }
-    SocketAddress local;
-    local.length = sizeof local.storage;
-    if (::getsockname(socket.get(), reinterpret_cast<sockaddr *>(&local.storage), &local.length) != 0) {
-        return TcpListenerResult{nullptr, lastError()};
+    if (std::error_code const error = detail::bindAndListen(socket.get(), address, options.backlog)) {
+        return TcpListenerResult{nullptr, error};
     }
-    auto registration = std::make_unique<Registration>(poller, socket.get());
-    if (registration->error()) {
-        return TcpListenerResult{nullptr, registration->error()};
+    SocketAddress const local = detail::localAddressOf(socket.get());
+    std::unique_ptr<TcpListener> listener(new TcpListener(poller, std::move(socket), local));
+    if (std::error_code const error = listener->registration.error()) {
+        return TcpListenerResult{nullptr, error};
     }
-    return TcpListenerResult{
-        std::unique_ptr<TcpListener>(new TcpListener(poller, std::move(socket), std::move(registration), local)),
-        std::error_code{}};
+    return TcpListenerResult{std::move(listener), std::error_code{}};
 }
 
 TcpStreamResult TcpListener::acceptUntil(Deadline const deadline) {
     AcceptResult accepted =
-        deadline == Deadline::max() ? io::accept(*registration) : io::acceptUntil(*registration, deadline);
+        deadline == Deadline::max() ? io::accept(registration) : io::acceptUntil(registration, deadline);
     if (not accepted) {
         return TcpStreamResult{nullptr, accepted.error};
     }
-    return TcpStream::adopt(poller, std::move(accepted.fd));
-}
-
-// --- BufWriter -------------------------------------------------------------------
-
-BufWriter::BufWriter(TcpStream &stream_, std::size_t const capacity_)
-    : stream(stream_), buffer(std::make_unique<char[]>(capacity_)), capacity(capacity_) {}
-
-IoResult BufWriter::write(void const *const data, std::size_t const length) {
-    if (used + length <= capacity) {
-        std::memcpy(buffer.get() + used, data, length);
-        used += length;
-        return IoResult{length, std::error_code{}};
-    }
-    iovec vectors[2] = {{buffer.get(), used}, {const_cast<void *>(data), length}};
-    IoResult const sent = stream.writevAll(vectors, 2);
-    std::size_t const fromBuffer = sent.bytes < used ? sent.bytes : used;
-    std::size_t const buffered = used;
-    used = 0;
-    if (not sent) {
-        // Keep what the peer did not get from the buffer; report the payload unsent.
-        std::memmove(buffer.get(), buffer.get() + fromBuffer, buffered - fromBuffer);
-        used = buffered - fromBuffer;
-        return IoResult{sent.bytes > buffered ? sent.bytes - buffered : 0, sent.error};
-    }
-    return IoResult{length, std::error_code{}};
-}
-
-IoResult BufWriter::flush() {
-    if (used == 0) {
-        return IoResult{0, std::error_code{}};
-    }
-    IoResult const sent = stream.writeAll(buffer.get(), used);
-    std::memmove(buffer.get(), buffer.get() + sent.bytes, used - sent.bytes);
-    used -= sent.bytes;
-    return sent;
+    return TcpStream::wrap(poller, std::move(accepted.fd)); // accept hands out non-blocking sockets
 }
 
 } // namespace io

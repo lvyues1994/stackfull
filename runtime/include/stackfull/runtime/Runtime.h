@@ -3,13 +3,18 @@
 #include <stackfull/coro/Config.h>
 #include <stackfull/coro/ForcedUnwind.h>
 #include <stackfull/io/Poller.h>
+#include <stackfull/io/Resolve.h>
+#include <stackfull/io/TcpStream.h>
 #include <stackfull/sched/Scheduler.h>
 #include <stackfull/sched/ThisTask.h>
 #include <stackfull/sync/Completion.h>
 
+#include <cstdint>
 #include <memory>
 #include <type_traits>
 #include <utility>
+
+#include <sys/socket.h>
 
 #if STACKFULL_HAS_EXCEPTIONS
 #include <exception>
@@ -166,5 +171,13 @@ auto blocking(F &&body) -> typename std::decay<decltype(body())>::type {
         new detail::BlockingJobImpl<R, F>(completion, std::forward<F>(body))));
     return detail::unwrap<R>(completion.get(), std::is_void<R>{});
 }
+
+// Name lookup without holding up the worker: io::resolve() on the blocking
+// pool (inline for numeric hosts, and on plain threads).
+io::ResolveResult resolve(char const *host, std::uint16_t port, int family = AF_UNSPEC);
+
+// resolve(), then io::TcpStream::connect() on defaultPoller() over the
+// addresses in order. `deadline` bounds the connecting, not the lookup.
+io::TcpStreamResult connectTcp(char const *host, std::uint16_t port, io::Deadline deadline = io::Deadline::max());
 
 } // namespace stackfull

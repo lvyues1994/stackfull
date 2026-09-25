@@ -3,6 +3,9 @@
 # stackfull_net_bench load generator on the others.
 #
 #   bench/net-compare.sh <sf|raw|tokio> <connections> <bytes> [seconds] [server-workers]
+#   bench/net-compare.sh <sf|raw|tokio> churn <client-tasks> [seconds] [server-workers]
+#
+# (churn: short connections — connect, one 64-byte round trip, close.)
 #
 # Prints the client's req/s and latency, then the server's CPU and context
 # switches per request, from the server's own getrusage() at exit divided
@@ -36,7 +39,11 @@ case $kind in
 esac
 server=$!
 sleep 0.5
-out=$(taskset -c "$client_cpus" "$build/bench/stackfull_net_bench" client $port $conns $bytes $secs $client_workers)
+if [ "$conns" = churn ]; then
+    out=$(taskset -c "$client_cpus" "$build/bench/stackfull_net_bench" churn $port $bytes $secs $client_workers)
+else
+    out=$(taskset -c "$client_cpus" "$build/bench/stackfull_net_bench" client $port $conns $bytes $secs $client_workers)
+fi
 wait $server || true
 trips=$(echo "$out" | awk '/^round trips in all:/ {print $5}')
 per=$(awk -v n="$trips" 'n > 0 && /^RUSAGE/ {cpu = sprintf("server per request: user %.2f + sys %.2f us", 1e6 * $3 / n, 1e6 * $5 / n)}

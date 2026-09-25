@@ -3,8 +3,10 @@
 #include <stackfull/io/Fd.h>
 #include <stackfull/io/Registration.h>
 
+#include <cerrno>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <system_error>
 
 #include <sys/socket.h>
@@ -61,6 +63,55 @@ IoResult writevAll(Registration &registration, iovec *vectors, int count);
 
 AcceptResult accept(Registration &listener);
 AcceptResult acceptUntil(Registration &listener, Deadline deadline);
+
+namespace detail {
+
+inline std::error_code waitNewer(Registration &registration, Interest const direction, std::uint32_t const seen,
+                                 Deadline const *const deadline) {
+    if (direction == Interest::Readable) {
+        return deadline != nullptr ? registration.waitReadableUntil(seen, *deadline) : registration.waitReadable(seen);
+    }
+    return deadline != nullptr ? registration.waitWritableUntil(seen, *deadline) : registration.waitWritable(seen);
+}
+
+} // namespace detail
+
+// The loop behind every transfer above, for other non-blocking system calls
+// on a registered descriptor (recvfrom, recvmmsg, ...). Calls `call` — which
+// returns ssize_t, or -1 with errno — until it succeeds, fails with
+// something other than EINTR/EAGAIN, or `deadline` (null: none) passes while
+// waiting for `direction`. The event count is read before each call, so a
+// report landing between the call and the wait is not lost. `asked` is the
+// byte count requested: on a byte stream a shorter success lets the next
+// call wait without asking the kernel (Registration::setKind).
+template <class Call>
+IoResult callWhenReady(Registration &registration, Interest const direction, std::size_t const asked,
+                       Deadline const *const deadline, Call const &call) {
+    for (;;) {
+        std::uint32_t const seen =
+            direction == Interest::Readable ? registration.readEvents() : registration.writeEvents();
+        if (registration.exhausted(direction, seen)) {
+            if (std::error_code const error = detail::waitNewer(registration, direction, seen, deadline)) {
+                return IoResult{0, error};
+            }
+            continue;
+        }
+        auto const n = call();
+        if (n >= 0) {
+            registration.noteTransfer(direction, seen, static_cast<std::size_t>(n), asked);
+            return IoResult{static_cast<std::size_t>(n), std::error_code{}};
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        if (errno != EAGAIN and errno != EWOULDBLOCK) {
+            return IoResult{0, lastError()};
+        }
+        if (std::error_code const error = detail::waitNewer(registration, direction, seen, deadline)) {
+            return IoResult{0, error};
+        }
+    }
+}
 
 // Non-blocking connect: starts it, waits for writability, reports SO_ERROR.
 std::error_code connect(Registration &registration, sockaddr const *address, socklen_t length);

@@ -358,6 +358,7 @@ int runChurn(std::uint16_t const port, int const tasks, double const seconds, st
     std::atomic<bool> counting{false};
     std::atomic<bool> stop{false};
     std::atomic<long> completed{0};
+    std::atomic<long> everything{0}; // warm-up included: to divide the server's rusage by
     std::atomic<long> failed{0};
     sync::WaitGroup done;
     done.add(static_cast<std::size_t>(tasks));
@@ -371,6 +372,7 @@ int runChurn(std::uint16_t const port, int const tasks, double const seconds, st
                     failed.fetch_add(1, std::memory_order_relaxed);
                     continue;
                 }
+                everything.fetch_add(1, std::memory_order_relaxed);
                 if (counting.load(std::memory_order_relaxed)) {
                     completed.fetch_add(1, std::memory_order_relaxed);
                 }
@@ -388,6 +390,7 @@ int runChurn(std::uint16_t const port, int const tasks, double const seconds, st
     done.wait();
     std::printf("churn, %d tasks: %8.0f connections/s (%ld failed)\n", tasks,
                 static_cast<double>(completed.load()) / elapsed, failed.load());
+    std::printf("round trips in all: %ld\n", everything.load());
     scheduler->stop();
     return 0;
 }
