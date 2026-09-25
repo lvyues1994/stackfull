@@ -56,26 +56,36 @@ std::error_code Registration::waitFor(Interest const direction, std::uint32_t co
     }
     sync::detail::Waiter waiter;
     sync::detail::Waker const me = waiter.waker();
-    // Any way out, forced unwind and timeout included: take our waker back
-    // if collect() has not already. Nothing ever points into this frame.
-    struct DetachOnExit {
-        Registration &self;
-        Interest direction;
-        sync::detail::Waker const &me;
-        ~DetachOnExit() { self.detach(direction, me); }
-    } detachOnExit{*this, direction, me};
-
     Interest armed = Interest::None;
     {
         sync::SpinLockGuard const guard(lock);
+        if (mine.events.load(std::memory_order_relaxed) != seen) {
+            return std::error_code{}; // a report landed first: nothing to wait for
+        }
         mine.waker = me;
         // Pollers without edge triggering watch one-shot: arm for everything
         // anyone waits on, so the other direction's waiter is not disarmed.
         armed = (read.waker.isEmpty() ? Interest::None : Interest::Readable) |
                 (write.waker.isEmpty() ? Interest::None : Interest::Writable);
     }
-    if (std::error_code const error = owner.arm(*this, armed)) {
-        return error;
+    // From here the count only moves in collect(), which takes our waker in
+    // the same critical section. Leaving before that (timeout, error, forced
+    // unwind) we take it back ourselves; nothing ever points into this frame.
+    struct DetachUnlessTaken {
+        Registration &self;
+        Interest direction;
+        sync::detail::Waker const &me;
+        bool taken = false;
+        ~DetachUnlessTaken() {
+            if (not taken) {
+                self.detach(direction, me);
+            }
+        }
+    } detach{*this, direction, me};
+    if (not everyArrivalReported) {
+        if (std::error_code const error = owner.arm(*this, armed)) {
+            return error;
+        }
     }
     // collect() bumps the count before waking and wakeups are sticky, so a
     // report landing before we block is not lost.
@@ -89,6 +99,7 @@ std::error_code Registration::waitFor(Interest const direction, std::uint32_t co
             return std::make_error_code(std::errc::timed_out);
         }
     }
+    detach.taken = true;
     return std::error_code{};
 }
 

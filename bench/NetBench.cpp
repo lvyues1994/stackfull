@@ -83,10 +83,21 @@ std::unique_ptr<Scheduler> makeNetScheduler(Poller &poller, std::size_t const wo
 }
 
 // Servers exit on their own after `lifetime` seconds (0: never), printing
-// the process's resource usage to stderr.
-[[noreturn]] void serveFor(double const lifetime) {
+// the process's resource usage (and the scheduler's idle sleeps and steals)
+// to stderr.
+[[noreturn]] void serveFor(double const lifetime, Scheduler const *const scheduler = nullptr) {
     if (lifetime > 0) {
         std::this_thread::sleep_for(std::chrono::duration<double>(lifetime));
+        if (scheduler != nullptr) {
+            std::uint64_t sleeps = 0;
+            std::uint64_t steals = 0;
+            for (WorkerStats const &worker : scheduler->stats().workers) {
+                sleeps += worker.sleeps;
+                steals += worker.steals;
+            }
+            std::fprintf(stderr, "SCHED sleeps %llu steals %llu\n", static_cast<unsigned long long>(sleeps),
+                         static_cast<unsigned long long>(steals));
+        }
         rusage usage{};
         ::getrusage(RUSAGE_SELF, &usage);
         std::fprintf(stderr, "RUSAGE user %.3f sys %.3f voluntary %ld involuntary %ld\n",
@@ -119,7 +130,13 @@ void printLatency(char const *const name, std::vector<float> &samples) {
 
 int runServer(std::uint16_t const port, std::size_t const workers, double const lifetime) {
     auto poller = makeDefaultPoller();
-    auto scheduler = makeNetScheduler(*poller, workers);
+    SchedulerOptions options;
+    options.workers = workers;
+    options.driver = poller.get();
+    if (char const *const spin = std::getenv("NET_BENCH_IDLE_SPIN_US")) {
+        options.idleSpin = std::chrono::microseconds{std::atol(spin)};
+    }
+    auto scheduler = makeScheduler(options);
     TcpListenerResult bound = TcpListener::bind(*poller, SocketAddress::any(port), 4096);
     if (not bound) {
         std::fprintf(stderr, "bind: %s\n", bound.error.message().c_str());
@@ -146,7 +163,7 @@ int runServer(std::uint16_t const port, std::size_t const workers, double const 
             });
         }
     });
-    serveFor(lifetime);
+    serveFor(lifetime, scheduler.get());
 }
 
 // --- epoll baseline ----------------------------------------------------------------

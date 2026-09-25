@@ -39,5 +39,7 @@ sleep 0.5
 out=$(taskset -c "$client_cpus" "$build/bench/stackfull_net_bench" client $port $conns $bytes $secs $client_workers)
 wait $server || true
 trips=$(echo "$out" | awk '/^round trips in all:/ {print $5}')
-per=$(awk -v n="$trips" '/^RUSAGE/ && n > 0 {printf "server per request: user %.2f + sys %.2f us", 1e6 * $3 / n, 1e6 * $5 / n}' "$usage")
+per=$(awk -v n="$trips" 'n > 0 && /^RUSAGE/ {cpu = sprintf("server per request: user %.2f + sys %.2f us", 1e6 * $3 / n, 1e6 * $5 / n)}
+                         n > 0 && /^SCHED/ {sched = sprintf(", %.3f sleeps %.3f steals", $3 / n, $5 / n)}
+                         END {print cpu sched}' "$usage")
 echo "$(printf '%-5s' $kind) $(echo "$out" | grep -v '^round trips')  $per"
