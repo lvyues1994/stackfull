@@ -172,13 +172,18 @@ TEST(Completion, GetForTimesOutAndALateSetIsHarmless) {
     std::error_code seen;
     Completion<std::pair<int, std::error_code>> read;
     ASSERT_TRUE(scheduler->spawn([&] {
-        sdk.readAsync(1, read, milliseconds{60}); // slower than our patience
+        // Far slower than our patience: a stalled CI machine must not turn
+        // the timeout into a result. A lost timer still shows up as one.
+        sdk.readAsync(1, read, milliseconds{300});
         seen = read.getFor(milliseconds{10}).error;
         done.done();
     }));
     done.wait();
     EXPECT_EQ(seen, std::errc::timed_out);
-    std::this_thread::sleep_for(milliseconds{80}); // the SDK still completes into shared state
+    auto const giveUp = std::chrono::steady_clock::now() + std::chrono::seconds{2};
+    while (not read.isReady() and std::chrono::steady_clock::now() < giveUp) {
+        std::this_thread::sleep_for(milliseconds{5}); // the SDK still completes into shared state
+    }
     EXPECT_TRUE(read.isReady());
 }
 

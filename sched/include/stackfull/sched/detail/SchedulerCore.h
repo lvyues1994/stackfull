@@ -159,7 +159,9 @@ struct SchedulerCore {
     std::atomic<std::int64_t> rampUpDeadline{kNoDeadline};
     // When ensureTimekeeper() last woke a worker (steady_clock ticks).
     std::atomic<std::int64_t> lastKeeperWake{std::numeric_limits<std::int64_t>::min() / 2};
-    static constexpr std::int64_t kScanningTimers = std::numeric_limits<std::int64_t>::min();
+    // Must compare above every deadline: an adder that sees it wakes the
+    // timekeeper, since the scan may already have missed its timer.
+    static constexpr std::int64_t kScanningTimers = std::numeric_limits<std::int64_t>::max();
 };
 
 } // namespace detail
