@@ -26,6 +26,10 @@ namespace detail {
 // ThreadState.cpp). Never inlined so the optimizer cannot cache a TLS address
 // across a switch that may resume on another thread.
 STACKFULL_NOINLINE ThreadState &currentThreadState() noexcept;
+// The thread's state if it has one, without creating it: for questions a
+// thread that never ran a coroutine answers "no" to (am I a worker, am I in
+// a task), asked from foreign threads such as an SDK's callback thread.
+STACKFULL_NOINLINE ThreadState *peekThreadState() noexcept;
 
 inline bool isNativeContext(ThreadState const &thread, ContextBlock const &block) noexcept {
     return &block == &thread.mainBlock;

@@ -57,14 +57,21 @@ ThreadState *createThreadState() noexcept {
 
 #if defined(STACKFULL_TLS_BACKEND_THREAD_LOCAL)
 
+namespace {
+// Trivial type + constant initializer: no guard variable, no destructor
+// registration — a single TLS load on the fast path.
+thread_local ThreadState *cached STACKFULL_TLS_MODEL_ATTR = nullptr;
+} // namespace
+
 ThreadState &currentThreadState() noexcept {
-    // Trivial type + constant initializer: no guard variable, no destructor
-    // registration — a single TLS load on the fast path.
-    static thread_local ThreadState *cached STACKFULL_TLS_MODEL_ATTR = nullptr;
     if (cached == nullptr) {
         cached = createThreadState();
     }
     return *cached;
+}
+
+ThreadState *peekThreadState() noexcept {
+    return cached;
 }
 
 #else
@@ -77,6 +84,11 @@ ThreadState &currentThreadState() noexcept {
         return *static_cast<ThreadState *>(raw);
     }
     return *createThreadState();
+}
+
+ThreadState *peekThreadState() noexcept {
+    ::pthread_once(&stateKeyOnce, &createStateKey);
+    return stateKeyValid ? static_cast<ThreadState *>(::pthread_getspecific(stateKey)) : nullptr;
 }
 
 #endif

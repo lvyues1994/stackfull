@@ -99,9 +99,10 @@ inline void Worker::gather(Task &task) noexcept {
 // SchedulerCore
 // ---------------------------------------------------------------------------
 
+// A foreign thread waking a task gets no thread state just for asking.
 inline Worker *SchedulerCore::currentWorker() noexcept {
-    coro::ThreadState &thread = coro::detail::currentThreadState();
-    auto *const worker = static_cast<Worker *>(thread.worker);
+    coro::ThreadState *const thread = coro::detail::peekThreadState();
+    auto *const worker = thread != nullptr ? static_cast<Worker *>(thread->worker) : nullptr;
     return (worker != nullptr and &worker->core == this) ? worker : nullptr;
 }
 
@@ -298,8 +299,9 @@ STACKFULL_ALWAYS_INLINE CurrentTask currentTask() noexcept {
 }
 
 inline bool isInsideTask() noexcept {
-    coro::ThreadState const &thread = coro::detail::currentThreadState();
-    return thread.worker != nullptr and not coro::detail::isNativeContext(thread, *thread.current);
+    coro::ThreadState const *const thread = coro::detail::peekThreadState();
+    return thread != nullptr and thread->worker != nullptr and
+           not coro::detail::isNativeContext(*thread, *thread->current);
 }
 
 } // namespace detail
