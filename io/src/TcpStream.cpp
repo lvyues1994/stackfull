@@ -35,19 +35,29 @@ TcpStreamResult TcpStream::wrap(Poller &poller, Fd socket) {
     return TcpStreamResult{std::move(stream), std::error_code{}};
 }
 
-TcpStreamResult TcpStream::connect(Poller &poller, SocketAddress const &address, Deadline const deadline) {
+TcpStreamResult TcpStream::startConnect(Poller &poller, SocketAddress const &address, bool &inProgress) {
     Fd socket;
     if (std::error_code const error = detail::openSocket(address.family(), SOCK_STREAM, socket)) {
         return TcpStreamResult{nullptr, error};
     }
-    TcpStreamResult result = wrap(poller, std::move(socket));
-    if (not result) {
+    if (std::error_code const error = io::startConnect(socket.get(), address.get(), address.length, inProgress)) {
+        return TcpStreamResult{nullptr, error};
+    }
+    return wrap(poller, std::move(socket));
+}
+
+TcpStreamResult TcpStream::connect(Poller &poller, SocketAddress const &address, Deadline const deadline) {
+    bool inProgress = false;
+    TcpStreamResult result = startConnect(poller, address, inProgress);
+    if (not result or not inProgress) {
         return result;
     }
     Registration &registration = result.stream->events();
-    std::error_code const error = deadline == Deadline::max()
-                                      ? io::connect(registration, address.get(), address.length)
-                                      : io::connectUntil(registration, address.get(), address.length, deadline);
+    std::error_code error = deadline == Deadline::max() ? registration.waitWritable(0)
+                                                        : registration.waitWritableUntil(0, deadline);
+    if (not error) {
+        error = io::finishConnect(registration.fd());
+    }
     if (error) {
         return TcpStreamResult{nullptr, error};
     }
@@ -119,6 +129,14 @@ TcpStreamResult TcpListener::acceptUntil(Deadline const deadline) {
         return TcpStreamResult{nullptr, accepted.error};
     }
     return TcpStream::wrap(poller, std::move(accepted.fd)); // accept hands out non-blocking sockets
+}
+
+TcpStreamResult TcpListener::tryAccept(bool &wouldBlock) {
+    AcceptResult accepted = io::tryAccept(registration, wouldBlock);
+    if (not accepted.fd) {
+        return TcpStreamResult{nullptr, accepted.error};
+    }
+    return TcpStream::wrap(poller, std::move(accepted.fd));
 }
 
 } // namespace io

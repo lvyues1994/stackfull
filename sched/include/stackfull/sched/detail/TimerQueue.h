@@ -26,12 +26,23 @@ struct TimerQueue;
 // One pending deadline. Lives on the sleeping task's stack for as long as it
 // is queued; the queue drops its reference under the lock before the token
 // is woken, so the owner may return as soon as it observes `fired`.
+//
+// Or it calls back instead of waking a task (stackfull::exec): `callback`
+// runs on the firing thread once the queue's lock is released, and may
+// destroy the entry.
 struct TimerEntry {
     TimePoint deadline{};
     WakeToken token{};
     TimerQueue *queue = nullptr; // where add() put it: cancel there, wherever the task runs now
     std::size_t heapIndex = kNotQueued;
     std::atomic<bool> fired{false};
+    // Must not throw; not spelled noexcept (that changes the mangling
+    // between C++14 and C++17).
+    void (*callback)(void *argument) = nullptr;
+    void *argument = nullptr;
+    // A cancel() found the entry not queued: addUnlessCancelled() refuses
+    // it. Under the queue's lock.
+    bool cancelled = false;
 
     static constexpr std::size_t kNotQueued = static_cast<std::size_t>(-1);
 };
@@ -57,12 +68,20 @@ struct TimerQueue {
     // told to shorten its sleep).
     bool add(TimerEntry &entry) noexcept;
 
+    // For a callback entry whose `queue` is this one already: false — not
+    // queued — if a cancel() came first or the queue is closed.
+    bool addUnlessCancelled(TimerEntry &entry) noexcept;
+
     // True if the entry was still queued (and is now removed); false if it
-    // already fired.
+    // already fired, or was not added yet (then it is marked cancelled).
     bool cancel(TimerEntry &entry) noexcept;
 
-    // Wakes every entry with deadline <= now. Returns how many.
+    // Wakes (or calls back) every entry with deadline <= now. Returns how many.
     std::size_t fireExpired(TimePoint now) noexcept;
+
+    // At Scheduler::stop(): calls back every callback entry now and refuses
+    // further ones. Task entries stay; their tasks are woken anyway.
+    void fireCallbacksAndClose() noexcept;
 
     // Lock-free and possibly stale by one operation: scheduling heuristics only.
     bool isEmptyApprox() const noexcept { return size.load(std::memory_order_relaxed) == 0; }
@@ -77,8 +96,13 @@ private:
     void siftDown(std::size_t index) noexcept;
     void swapAt(std::size_t a, std::size_t b) noexcept;
     void publishLocked() noexcept;
+    void removeLocked(std::size_t index) noexcept;
+    // Marks a just-removed entry fired and calls back or wakes it after
+    // releasing the lock.
+    void fireAndUnlock(TimerEntry &entry) noexcept;
 
     std::atomic<bool> locked{false};
+    bool closed = false; // under the lock
     void lock() noexcept;
     void unlock() noexcept { locked.store(false, std::memory_order_release); }
 

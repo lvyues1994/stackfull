@@ -39,6 +39,10 @@ struct TcpStream final : StreamSocket {
                                    Deadline deadline = Deadline::max());
     // Takes over an already connected socket (made non-blocking here).
     static TcpStreamResult adopt(Poller &poller, Fd socket);
+    // connect() without the wait, for operations that wait their own way
+    // (stackfull::exec). While `inProgress`, wait for the stream's first
+    // write report (events().writeEvents() != 0), then io::finishConnect().
+    static TcpStreamResult startConnect(Poller &poller, SocketAddress const &address, bool &inProgress);
 
     std::error_code setNoDelay(bool enabled) noexcept;
 
@@ -83,9 +87,14 @@ struct TcpListener {
                            std::chrono::duration_cast<std::chrono::nanoseconds>(timeout));
     }
 
+    // accept() without the wait (stackfull::exec): on `wouldBlock`, wait for
+    // a read report on events() newer than the count read before the call.
+    TcpStreamResult tryAccept(bool &wouldBlock);
+
     SocketAddress const &localAddress() const noexcept { return local; }
     std::uint16_t port() const noexcept { return local.port(); }
     int fd() const noexcept { return socket.get(); }
+    Registration &events() noexcept { return registration; }
 
 private:
     TcpListener(Poller &poller_, Fd socket_, SocketAddress const &local_) noexcept

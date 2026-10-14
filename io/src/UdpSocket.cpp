@@ -134,25 +134,40 @@ UdpSocketResult UdpSocket::connect(Poller &poller, SocketAddress const &peer) {
 }
 
 IoResult UdpSocket::send(void const *const data, std::size_t const length) {
-    int const descriptor = socket.get();
-    return callWhenReady(registration, Interest::Writable, length, nullptr,
-                         [&] { return ::send(descriptor, data, length, kNoSigPipe); });
+    return retryWhenReady(registration, Interest::Writable, nullptr,
+                          [&](std::uint32_t const seen) { return trySend(seen, data, length, nullptr); });
 }
 
 IoResult UdpSocket::sendTo(void const *const data, std::size_t const length, SocketAddress const &to) {
-    int const descriptor = socket.get();
-    return callWhenReady(registration, Interest::Writable, length, nullptr,
-                         [&] { return ::sendto(descriptor, data, length, kNoSigPipe, to.get(), to.length); });
+    return retryWhenReady(registration, Interest::Writable, nullptr,
+                          [&](std::uint32_t const seen) { return trySend(seen, data, length, &to); });
 }
 
 IoResult UdpSocket::recvImpl(void *const buffer, std::size_t const length, SocketAddress *const from,
                              Deadline const *const deadline) {
+    return retryWhenReady(registration, Interest::Readable, deadline,
+                          [&](std::uint32_t const seen) { return tryRecv(seen, buffer, length, from); });
+}
+
+IoAttempt UdpSocket::trySend(std::uint32_t const seen, void const *const data, std::size_t const length,
+                             SocketAddress const *const to) {
+    int const descriptor = socket.get();
+    if (to == nullptr) {
+        return tryCall(registration, Interest::Writable, length, seen,
+                       [&] { return ::send(descriptor, data, length, kNoSigPipe); });
+    }
+    return tryCall(registration, Interest::Writable, length, seen,
+                   [&] { return ::sendto(descriptor, data, length, kNoSigPipe, to->get(), to->length); });
+}
+
+IoAttempt UdpSocket::tryRecv(std::uint32_t const seen, void *const buffer, std::size_t const length,
+                             SocketAddress *const from) {
     int const descriptor = socket.get();
     if (from == nullptr) {
-        return callWhenReady(registration, Interest::Readable, length, deadline,
-                             [&] { return ::recv(descriptor, buffer, length, 0); });
+        return tryCall(registration, Interest::Readable, length, seen,
+                       [&] { return ::recv(descriptor, buffer, length, 0); });
     }
-    return callWhenReady(registration, Interest::Readable, length, deadline, [&] {
+    return tryCall(registration, Interest::Readable, length, seen, [&] {
         socklen_t addressLength = sizeof from->storage;
         ssize_t const n =
             ::recvfrom(descriptor, buffer, length, 0, reinterpret_cast<sockaddr *>(&from->storage), &addressLength);

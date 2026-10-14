@@ -50,25 +50,63 @@ void Semaphore::acquireSlow() {
     unlinkOnUnwind.disarm();
 }
 
+detail::EnqueueResult Semaphore::acquireOrEnqueue(detail::Waiter &waiter) noexcept {
+    if (tryAcquire()) {
+        return detail::EnqueueResult::Ready;
+    }
+    SpinLockGuard const guard(lock);
+    if (waiter.cancelled) {
+        return detail::EnqueueResult::Cancelled;
+    }
+    waiterCount.fetch_add(1, std::memory_order_seq_cst);
+    if (tryAcquire()) {
+        waiterCount.fetch_sub(1, std::memory_order_seq_cst);
+        return detail::EnqueueResult::Ready;
+    }
+    waiters.pushBack(waiter);
+    return detail::EnqueueResult::Enqueued;
+}
+
+bool Semaphore::cancel(detail::Waiter &waiter) noexcept {
+    SpinLockGuard const guard(lock);
+    if (not detail::cancelWaiter(waiters, waiter)) {
+        return false;
+    }
+    waiterCount.fetch_sub(1, std::memory_order_seq_cst);
+    return true;
+}
+
 void Semaphore::release() noexcept {
     permits.fetch_add(1, std::memory_order_seq_cst);
     if (waiterCount.load(std::memory_order_seq_cst) == 0) {
         return;
     }
-    // Hand out every permit a waiter can have, in FIFO order. Notified outside
-    // the lock is not needed: notify() only sets a flag and wakes.
-    SpinLockGuard const guard(lock);
-    while (not waiters.isEmpty()) {
-        std::size_t count = permits.load(std::memory_order_seq_cst);
-        bool taken = false;
-        while (count > 0 and not taken) {
-            taken = permits.compare_exchange_weak(count, count - 1, std::memory_order_seq_cst);
+    // Hand out every permit a waiter can have, in FIFO order, and notify
+    // once the lock is released: a callback waiter's continuation runs inside
+    // notify() and may well come back to this semaphore.
+    detail::Waiter *first = nullptr;
+    detail::Waiter **last = &first;
+    {
+        SpinLockGuard const guard(lock);
+        while (not waiters.isEmpty()) {
+            std::size_t count = permits.load(std::memory_order_seq_cst);
+            bool taken = false;
+            while (count > 0 and not taken) {
+                taken = permits.compare_exchange_weak(count, count - 1, std::memory_order_seq_cst);
+            }
+            if (not taken) {
+                break; // a fast-path acquirer got there first; the rest keep waiting
+            }
+            detail::Waiter *const waiter = waiters.popFront();
+            waiterCount.fetch_sub(1, std::memory_order_seq_cst);
+            *last = waiter;
+            last = &waiter->next;
         }
-        if (not taken) {
-            return; // a fast-path acquirer got there first; the waiter keeps waiting
-        }
-        detail::Waiter *const waiter = waiters.popFront();
-        waiterCount.fetch_sub(1, std::memory_order_seq_cst);
+    }
+    *last = nullptr;
+    while (first != nullptr) {
+        detail::Waiter *const waiter = first;
+        first = waiter->next; // read before notify(): the waiter may be gone right after
         waiter->notify();
     }
 }

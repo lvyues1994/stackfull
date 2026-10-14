@@ -33,24 +33,30 @@ bool TimerQueue::add(TimerEntry &entry) noexcept {
     return becameEarliest;
 }
 
+bool TimerQueue::addUnlessCancelled(TimerEntry &entry) noexcept {
+    lock();
+    if (entry.cancelled or closed) {
+        unlock();
+        return false;
+    }
+    entry.fired.store(false, std::memory_order_relaxed);
+    entry.heapIndex = heap.size();
+    heap.push_back(&entry);
+    siftUp(entry.heapIndex);
+    publishLocked();
+    unlock();
+    return true;
+}
+
 bool TimerQueue::cancel(TimerEntry &entry) noexcept {
     lock();
     std::size_t const index = entry.heapIndex;
     if (index == TimerEntry::kNotQueued) {
+        entry.cancelled = true;
         unlock();
         return false;
     }
-    std::size_t const last = heap.size() - 1;
-    if (index != last) {
-        swapAt(index, last);
-    }
-    heap.pop_back();
-    entry.heapIndex = TimerEntry::kNotQueued;
-    if (index != last) {
-        siftDown(index);
-        siftUp(index);
-    }
-    publishLocked();
+    removeLocked(index);
     unlock();
     return true;
 }
@@ -64,24 +70,58 @@ std::size_t TimerQueue::fireExpired(TimePoint const now) noexcept {
             return fired;
         }
         TimerEntry &entry = *heap[0];
-        std::size_t const last = heap.size() - 1;
-        if (last != 0) {
-            swapAt(0, last);
-        }
-        heap.pop_back();
-        entry.heapIndex = TimerEntry::kNotQueued;
-        if (last != 0) {
-            siftDown(0);
-        }
-        publishLocked();
-        // Copy the token and mark fired *inside* the lock; wake outside it.
-        // The sleeper may return (and free the entry) as soon as it sees
-        // `fired`, so the entry is not touched after this point.
-        WakeToken const token = entry.token;
-        entry.fired.store(true, std::memory_order_release);
-        unlock();
-        token.wake();
+        removeLocked(0);
+        fireAndUnlock(entry);
         ++fired;
+    }
+}
+
+void TimerQueue::fireCallbacksAndClose() noexcept {
+    for (;;) {
+        lock();
+        closed = true;
+        std::size_t index = 0;
+        while (index < heap.size() and heap[index]->callback == nullptr) {
+            ++index;
+        }
+        if (index == heap.size()) {
+            unlock();
+            return;
+        }
+        TimerEntry &entry = *heap[index];
+        removeLocked(index);
+        fireAndUnlock(entry);
+    }
+}
+
+void TimerQueue::removeLocked(std::size_t const index) noexcept {
+    TimerEntry &entry = *heap[index];
+    std::size_t const last = heap.size() - 1;
+    if (index != last) {
+        swapAt(index, last);
+    }
+    heap.pop_back();
+    entry.heapIndex = TimerEntry::kNotQueued;
+    if (index != last) {
+        siftDown(index);
+        siftUp(index);
+    }
+    publishLocked();
+}
+
+// Copy what is needed and mark fired *inside* the lock; act outside it. The
+// sleeper may return (and free the entry) as soon as it sees `fired`, a
+// callback's owner once called, so the entry is not touched after this.
+void TimerQueue::fireAndUnlock(TimerEntry &entry) noexcept {
+    WakeToken const token = entry.token;
+    auto const callback = entry.callback;
+    void *const argument = entry.argument;
+    entry.fired.store(true, std::memory_order_release);
+    unlock();
+    if (callback != nullptr) {
+        callback(argument);
+    } else {
+        token.wake();
     }
 }
 

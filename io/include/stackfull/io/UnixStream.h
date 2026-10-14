@@ -44,6 +44,8 @@ struct UnixStream final : StreamSocket {
     static UnixStreamPair pair(Poller &poller);
     // Takes over an already connected socket (made non-blocking here).
     static UnixStreamResult adopt(Poller &poller, Fd socket);
+    // connect() without the wait; see TcpStream::startConnect.
+    static UnixStreamResult startConnect(Poller &poller, SocketAddress const &address, bool &inProgress);
 
 private:
     friend struct UnixListener;
@@ -78,8 +80,12 @@ struct UnixListener {
                            std::chrono::duration_cast<std::chrono::nanoseconds>(timeout));
     }
 
+    // accept() without the wait; see TcpListener::tryAccept.
+    UnixStreamResult tryAccept(bool &wouldBlock);
+
     SocketAddress const &localAddress() const noexcept { return local; }
     int fd() const noexcept { return socket.get(); }
+    Registration &events() noexcept { return registration; }
 
 private:
     UnixListener(Poller &poller_, Fd socket_, SocketAddress const &local_) noexcept

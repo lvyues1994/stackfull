@@ -26,6 +26,13 @@ struct Semaphore {
 
     std::size_t available() const noexcept { return permits.load(std::memory_order_acquire); }
 
+    // acquire() for a callback waiter (stackfull::exec): Ready — a permit was
+    // taken now; Enqueued — the callback means one was taken on its behalf;
+    // Cancelled — cancel() came first.
+    detail::EnqueueResult acquireOrEnqueue(detail::Waiter &waiter) noexcept;
+    // True if `waiter` was queued and now is not; it got no permit.
+    bool cancel(detail::Waiter &waiter) noexcept;
+
 private:
     void acquireSlow();
 

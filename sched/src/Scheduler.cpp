@@ -73,6 +73,7 @@ struct SchedulerImpl final : Scheduler {
         if (core_.stopping.exchange(true, std::memory_order_acq_rel)) {
             return;
         }
+        core_.fireCallbackTimersAndClose();
         core_.wakeAllParked();
         core_.parkedWoken.store(true, std::memory_order_release);
         for (auto const &worker : core_.workers) {

@@ -39,8 +39,10 @@ struct JoinableSpawnResult {
 //            code sees this_task::stopRequested(), and tasks still parked
 //            afterwards are unwound (ForcedUnwind) — or, without exceptions,
 //            released without running their destructors — unless they hold
-//            a this_task::NoForcedStop. Workers exit when no task is left.
-//            A task that never parks cannot be stopped.
+//            a this_task::NoForcedStop. Timers that call back (exec's
+//            schedule_after) are called back at once, on the calling thread.
+//            Workers exit when no task is left. A task that never parks
+//            cannot be stopped.
 //
 // The destructor requests stop() and joins the background threads.
 struct Scheduler {
@@ -86,6 +88,14 @@ struct Scheduler {
     // Each TaskInfo is a copy taken at that moment; the task may have moved
     // on by the time `visit` sees it. Thread-safe.
     virtual void forEachTask(std::function<void(TaskInfo const &)> const &visit) const = 0;
+
+    // True once stop() has begun.
+    bool stopRequested() noexcept { return core().stopping.load(std::memory_order_acquire); }
+
+    // Timers that call back instead of waking a task, from any thread — for
+    // integrations such as stackfull::exec; see SchedulerCore.
+    detail::TimerQueue &callbackTimerQueue() noexcept { return core().callbackTimerQueue(); }
+    bool addCallbackTimer(detail::TimerEntry &entry) noexcept { return core().addCallbackTimer(entry); }
 
 protected:
     virtual detail::SchedulerCore &core() noexcept = 0;

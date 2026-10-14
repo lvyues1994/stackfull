@@ -78,6 +78,56 @@ IoResult writeAllImpl(Registration &registration, void const *const buffer, std:
 AcceptResult acceptImpl(Registration &listener, Deadline const *const deadline) {
     for (;;) {
         std::uint32_t const seen = listener.readEvents();
+        bool blocked = false;
+        AcceptResult accepted = tryAccept(listener, blocked);
+        if (not blocked) {
+            return accepted;
+        }
+        if (std::error_code const error = waitAgain(listener, Interest::Readable, seen, deadline)) {
+            return AcceptResult{Fd{}, error};
+        }
+    }
+}
+
+std::error_code connectImpl(Registration &registration, sockaddr const *const address, socklen_t const length,
+                            Deadline const *const deadline) {
+    std::uint32_t const seen = registration.writeEvents();
+    bool inProgress = false;
+    if (std::error_code const error = startConnect(registration.fd(), address, length, inProgress)) {
+        return error;
+    }
+    if (not inProgress) {
+        return std::error_code{};
+    }
+    if (std::error_code const error = waitAgain(registration, Interest::Writable, seen, deadline)) {
+        return error;
+    }
+    return finishConnect(registration.fd());
+}
+
+} // namespace
+
+IoAttempt tryRead(Registration &registration, std::uint32_t const seen, void *const buffer, std::size_t const length) {
+    int const fd = registration.fd();
+    if (registration.isSocket()) {
+        return tryCall(registration, Interest::Readable, length, seen, [&] { return ::recv(fd, buffer, length, 0); });
+    }
+    return tryCall(registration, Interest::Readable, length, seen, [&] { return ::read(fd, buffer, length); });
+}
+
+IoAttempt tryWrite(Registration &registration, std::uint32_t const seen, void const *const buffer,
+                   std::size_t const length) {
+    int const fd = registration.fd();
+    if (registration.isSocket()) {
+        return tryCall(registration, Interest::Writable, length, seen,
+                       [&] { return ::send(fd, buffer, length, kNoSigPipe); });
+    }
+    return tryCall(registration, Interest::Writable, length, seen, [&] { return ::write(fd, buffer, length); });
+}
+
+AcceptResult tryAccept(Registration &listener, bool &blocked) {
+    blocked = false;
+    for (;;) {
 #if defined(SOCK_NONBLOCK) && defined(SOCK_CLOEXEC)
         int const fd = ::accept4(listener.fd(), nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
 #else
@@ -95,27 +145,20 @@ AcceptResult acceptImpl(Registration &listener, Deadline const *const deadline) 
         if (errno == EINTR) {
             continue;
         }
-        if (not wouldBlock(errno)) {
-            return AcceptResult{Fd{}, lastError()};
-        }
-        if (std::error_code const error = waitAgain(listener, Interest::Readable, seen, deadline)) {
-            return AcceptResult{Fd{}, error};
-        }
+        blocked = wouldBlock(errno);
+        return AcceptResult{Fd{}, blocked ? std::error_code{} : lastError()};
     }
 }
 
-std::error_code connectImpl(Registration &registration, sockaddr const *const address, socklen_t const length,
-                            Deadline const *const deadline) {
-    std::uint32_t const seen = registration.writeEvents();
+std::error_code startConnect(int const fd, sockaddr const *const address, socklen_t const length,
+                             bool &inProgress) noexcept {
+    inProgress = false;
     for (;;) {
-        if (::connect(registration.fd(), address, length) == 0) {
+        if (::connect(fd, address, length) == 0 or errno == EISCONN) {
             return std::error_code{};
         }
         if (errno == EINTR) {
             continue;
-        }
-        if (errno == EISCONN) {
-            return std::error_code{};
         }
         // EAGAIN is not "in progress": no connection was started (TCP: no
         // local port left; Unix domain: the listener's backlog is full), and
@@ -123,20 +166,19 @@ std::error_code connectImpl(Registration &registration, sockaddr const *const ad
         if (errno != EINPROGRESS and errno != EALREADY) {
             return lastError();
         }
-        break;
+        inProgress = true;
+        return std::error_code{};
     }
-    if (std::error_code const error = waitAgain(registration, Interest::Writable, seen, deadline)) {
-        return error;
-    }
+}
+
+std::error_code finishConnect(int const fd) noexcept {
     int soError = 0;
     socklen_t soLength = sizeof soError;
-    if (::getsockopt(registration.fd(), SOL_SOCKET, SO_ERROR, &soError, &soLength) != 0) {
+    if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &soError, &soLength) != 0) {
         return lastError();
     }
     return soError == 0 ? std::error_code{} : std::error_code(soError, std::generic_category());
 }
-
-} // namespace
 
 IoResult read(Registration &registration, void *const buffer, std::size_t const length) {
     return readImpl(registration, buffer, length, nullptr);

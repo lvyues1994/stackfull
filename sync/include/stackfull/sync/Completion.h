@@ -48,10 +48,10 @@ struct Outcome<void> {
 namespace detail {
 
 // Shared state of a Completion. The awaiter is recorded as a Waker *by
-// value* and woken under the lock; readiness lives here, not in the
-// awaiter's stack frame, so the producer never dereferences memory owned
-// by a task that may already be gone. One awaiter may register with
-// several sources at once (select).
+// value*, taken under the lock and woken after it; readiness lives here,
+// not in the awaiter's stack frame, so the producer never dereferences
+// memory owned by a task that may already be gone. One awaiter may
+// register with several sources at once (select).
 template <class T>
 struct CompletionState {
     SpinLock lock;
@@ -68,8 +68,31 @@ struct CompletionState {
             SpinLockGuard const guard(lock);
             ready.store(true, std::memory_order_release);
             toWake = consumer;
+            consumer.clear();
         }
         toWake.wake();
+    }
+
+    // For a callback waiter (stackfull::exec).
+    EnqueueResult attachOrReady(Waiter &w) noexcept {
+        SpinLockGuard const guard(lock);
+        if (ready.load(std::memory_order_acquire)) {
+            return EnqueueResult::Ready;
+        }
+        if (w.cancelled) {
+            return EnqueueResult::Cancelled;
+        }
+        consumer = w.waker();
+        return EnqueueResult::Enqueued;
+    }
+    bool cancel(Waiter &w) noexcept {
+        SpinLockGuard const guard(lock);
+        if (consumer == w.waker()) {
+            consumer.clear();
+            return true;
+        }
+        w.cancelled = true;
+        return false;
     }
 
     // False if already ready (nothing to wait for).
@@ -201,6 +224,14 @@ struct Completion {
     bool attach(detail::Waiter &waiter) const noexcept { return state->attach(waiter); }
     void detach(detail::Waiter &waiter) const noexcept { state->detach(waiter); }
 
+    // get() for a callback waiter (stackfull::exec): once Ready, or after the
+    // callback, get() returns at once. cancel() is true if `waiter` was
+    // attached and now is not.
+    detail::EnqueueResult attachOrReady(detail::Waiter &waiter) const noexcept {
+        return state->attachOrReady(waiter);
+    }
+    bool cancel(detail::Waiter &waiter) const noexcept { return state->cancel(waiter); }
+
 private:
     std::shared_ptr<detail::CompletionState<T>> state;
 };
@@ -286,6 +317,11 @@ struct Completion<void> {
 
     bool attach(detail::Waiter &waiter) const noexcept { return state->attach(waiter); }
     void detach(detail::Waiter &waiter) const noexcept { state->detach(waiter); }
+
+    detail::EnqueueResult attachOrReady(detail::Waiter &waiter) const noexcept {
+        return state->attachOrReady(waiter);
+    }
+    bool cancel(detail::Waiter &waiter) const noexcept { return state->cancel(waiter); }
 
 private:
     std::shared_ptr<detail::CompletionState<void>> state;

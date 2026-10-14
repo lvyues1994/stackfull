@@ -20,7 +20,7 @@ UnixStreamResult UnixStream::wrap(Poller &poller, Fd socket) {
     return UnixStreamResult{std::move(stream), std::error_code{}};
 }
 
-UnixStreamResult UnixStream::connect(Poller &poller, SocketAddress const &address, Deadline const deadline) {
+UnixStreamResult UnixStream::startConnect(Poller &poller, SocketAddress const &address, bool &inProgress) {
     if (address.family() != AF_UNIX) {
         return UnixStreamResult{nullptr, std::make_error_code(std::errc::address_family_not_supported)};
     }
@@ -28,14 +28,24 @@ UnixStreamResult UnixStream::connect(Poller &poller, SocketAddress const &addres
     if (std::error_code const error = detail::openSocket(AF_UNIX, SOCK_STREAM, socket)) {
         return UnixStreamResult{nullptr, error};
     }
-    UnixStreamResult result = wrap(poller, std::move(socket));
-    if (not result) {
+    if (std::error_code const error = io::startConnect(socket.get(), address.get(), address.length, inProgress)) {
+        return UnixStreamResult{nullptr, error};
+    }
+    return wrap(poller, std::move(socket));
+}
+
+UnixStreamResult UnixStream::connect(Poller &poller, SocketAddress const &address, Deadline const deadline) {
+    bool inProgress = false;
+    UnixStreamResult result = startConnect(poller, address, inProgress);
+    if (not result or not inProgress) {
         return result;
     }
     Registration &registration = result.stream->events();
-    std::error_code const error = deadline == Deadline::max()
-                                      ? io::connect(registration, address.get(), address.length)
-                                      : io::connectUntil(registration, address.get(), address.length, deadline);
+    std::error_code error = deadline == Deadline::max() ? registration.waitWritable(0)
+                                                        : registration.waitWritableUntil(0, deadline);
+    if (not error) {
+        error = io::finishConnect(registration.fd());
+    }
     if (error) {
         return UnixStreamResult{nullptr, error};
     }
@@ -104,6 +114,14 @@ UnixStreamResult UnixListener::acceptUntil(Deadline const deadline) {
     AcceptResult accepted =
         deadline == Deadline::max() ? io::accept(registration) : io::acceptUntil(registration, deadline);
     if (not accepted) {
+        return UnixStreamResult{nullptr, accepted.error};
+    }
+    return UnixStream::wrap(poller, std::move(accepted.fd));
+}
+
+UnixStreamResult UnixListener::tryAccept(bool &wouldBlock) {
+    AcceptResult accepted = io::tryAccept(registration, wouldBlock);
+    if (not accepted.fd) {
         return UnixStreamResult{nullptr, accepted.error};
     }
     return UnixStream::wrap(poller, std::move(accepted.fd));

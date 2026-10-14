@@ -76,7 +76,7 @@ struct PollPoller final : Poller {
             if (has(interest, Interest::Writable)) {
                 events |= POLLOUT;
             }
-            table[index].events = events;
+            table[index].events = static_cast<short>(table[index].events | events);
         }
         wake(); // a blocked wait() must pick the new interest up
         return std::error_code{};

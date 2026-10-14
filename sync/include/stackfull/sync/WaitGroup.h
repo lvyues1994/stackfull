@@ -23,6 +23,12 @@ struct WaitGroup {
 
     std::size_t pendingCount() const noexcept { return pending.load(std::memory_order_acquire); }
 
+    // wait() for a callback waiter (stackfull::exec): Ready if the count is
+    // zero, else Enqueued until done() brings it there (or Cancelled).
+    detail::EnqueueResult waitOrEnqueue(detail::Waiter &waiter) noexcept;
+    // True if `waiter` was queued and now is not.
+    bool cancel(detail::Waiter &waiter) noexcept;
+
 private:
     std::atomic<std::size_t> pending{0};
     SpinLock lock;

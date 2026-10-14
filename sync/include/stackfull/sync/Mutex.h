@@ -18,6 +18,10 @@ struct Mutex {
     bool tryLock() noexcept { return permit.tryAcquire(); }
     void unlock() noexcept { permit.release(); }
 
+    // lock() for a callback waiter (stackfull::exec); see Semaphore.
+    detail::EnqueueResult lockOrEnqueue(detail::Waiter &waiter) noexcept { return permit.acquireOrEnqueue(waiter); }
+    bool cancel(detail::Waiter &waiter) noexcept { return permit.cancel(waiter); }
+
 private:
     Semaphore permit;
 };

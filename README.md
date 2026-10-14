@@ -7,7 +7,7 @@
 ```
 ┌───────────────────────────────────────────────────────────┐
 │ exec (C++17)    sender/receiver 桥（lexec）：wait · spawn ·   │  ✔
-│                 scheduler                                     │
+│                 scheduler · 原生 sender：同步 · IO · 定时器   │
 ├───────────────────────────────────────────────────────────┤
 │ runtime         defaultScheduler · go · async · blockOn ·     │  ✔
 │                 blocking · resolve · connectTcp               │
@@ -305,10 +305,11 @@ io::BatchResult got = udp.socket->recvMany(batch, 32);   // 至少等到一个�
 - `BufWriter` 把小写入攒起来，一次 `writev` 连同放不下的负载一起发出。`BufReader` 每次补满缓冲只读一次：`readLine`（分隔符可选，超过长度上限报 `message_size`）、`readExactly`、`read` 都可带截止时间；`fill()/data()/consume()` 用来自己分帧。
 - `UdpSocket::bind` 是服务端形态（`recvFrom/sendTo`），`UdpSocket::connect` 是客户端形态（`send/recv`，其他来源的数据报由内核过滤）。`recvMany/sendMany` 在 Linux/Android 上走 `recvmmsg/sendmmsg`（每次系统调用最多 64 个，没有这两个调用的平台逐个收发），截断按数据报报告；单个 `recv` 截断时丢掉超出部分。
 - 名字解析：`io::resolve(host, port)` 同步调用 `getaddrinfo`（数字地址不查询，错误码在 `io::resolveCategory()`）。任务里用 `stackfull::resolve()`（放到阻塞线程池）或 `connectTcp(host, port, deadline)`（解析后按顺序尝试每个地址）；`TcpStream::connect` 本身也接受地址列表。
+- `TcpStream::connect` 先发起连接、再把套接字注册进 Poller，然后等第一次可写报告：一个还没连接的 TCP 套接字加入 epoll 时会立刻报告可写和挂断，先注册的话这次报告可能被当成握手完成，挂断还会把连接标成永久关闭、失去下面的短读跳过。自己管理 fd 时用 `io::startConnect` / `finishConnect` 按同样的顺序来。
 - `TcpListenOptions::reusePort`：多个监听者共用一个端口（`SO_REUSEPORT`），由内核分摊连接。
 - 套接字用 `recv/send` 读写，而不是 `read/write`：后者每次调用都要过 VFS 的文件权限钩子（这台机器上是 AppArmor，Android 上是 SELinux），换掉后单核回显吞吐 +11%。发送带 `MSG_NOSIGNAL`：向已被对端重置的连接写返回 `EPIPE`，不会触发 SIGPIPE 杀掉进程（没有 `MSG_NOSIGNAL` 的平台改设 `SO_NOSIGPIPE`）。
 - 底层接口仍在：`io::Registration` + `io::read/write/accept/connect/readv/writev`，用于自定义 fd；`Registration::setKind()` 声明描述符类型（`StreamSocket` / `DatagramSocket` / `Pipe` / `Other`），决定用哪组系统调用、是否按字节流处理。`io::callWhenReady(registration, direction, asked, deadline, call)` 就是这些读写背后的计数等待循环，其他非阻塞系统调用也可以套用。
-- **epoll 边沿触发**：fd 在 `add` 时一次注册读写两个方向，等待不调用 `epoll_ctl`；echo 往返的成功路径零 `epoll_ctl`。就绪按方向计数：操作在系统调用**之前**取计数快照，`EAGAIN` 后等待比快照新的报告，系统调用与等待之间到达的边沿不会丢。`poll` 后端（QNX）仍是一次性 arm，同一套计数协议成立。
+- **epoll 边沿触发**：fd 在 `add` 时一次注册读写两个方向，等待不调用 `epoll_ctl`；echo 往返的成功路径零 `epoll_ctl`。就绪按方向计数：操作在系统调用**之前**取计数快照，`EAGAIN` 后等待比快照新的报告，系统调用与等待之间到达的边沿不会丢。`poll` 后端（QNX）仍是一次性 arm，同一套计数协议成立；`arm()` 只往关注集合里加方向、报告后再去掉，两个方向的等待者不会互相覆盖。
 - **字节流的短读短写**：读到的字节少于请求，说明接收缓冲已读空；写进去的少于请求，说明发送缓冲已满。边沿触发下之后每次到达都会再报告，所以下一次直接等新报告，省掉那次必然 `EAGAIN` 的系统调用（Tokio 同样的做法），回显吞吐 +10%。对端关闭和出错按粘滞状态记下：数据和 FIN 一起到达时，读完数据不会因为跳过而漏掉 EOF。`poll` 后端是水平触发，不做这个跳过。
 - **timekeeper**：任一时刻只有一个空闲 worker 以最早的定时器为超时睡在 `Driver::wait()`（有 Driver 时即 `epoll_wait`）里，并负责触发到期定时器；其他空闲 worker 睡自己的 futex。忙碌的 worker 每 61 次分派做一次维护：触发到期定时器并对 Driver 做一次非阻塞轮询，所以全忙时 IO 也不会饿死。
 - 分派在表锁下一趟收集整批事件的等待者、解锁后再唤醒；事件携带 fd 号而非指针，`Registration` 析构后的迟到事件只会查不到。等待者按值记为 `Waker`，从不指向等待方的栈。
@@ -343,6 +344,42 @@ ex::sync_wait(ex::schedule(sf) | ex::then([] { /* 在 sf 的一个任务里：�
 - **结构化的 stop**：`Scheduler::stop()` 不强制展开正在 `exec::wait` 的任务（栈上的操作状态还在被别的线程使用），而是把停止请求转给被等待的 sender，等它完成后任务自己退出；一个不响应停止的 sender 会让 `stop()` 一直等下去。接收者的完成代码（`exec::spawn` 和 `schedule()` 之后的部分）同样不会被强制展开。`exec::spawn` 的任务若在 `wait` 之外被 `stop()` 结束，接收者仍恰好收到一次 `set_stopped`：开启异常时在展开途中发出，关闭异常时由调度器丢弃任务前的回调发出。核心为此提供两个钩子：`this_task::NoForcedStop`（持有期间 `stop()` 只唤醒、不展开）和 `TaskContext`（集成层挂在任务上的记录，带被丢弃时的回调）。
 - 任务里调用 `lexec::sync_wait` 会阻塞整个 worker 线程，应改用 `exec::wait`。
 
+### 原生 sender
+
+同步原语、IO 和定时器也直接提供 sender。等待不占任务：原本任务 park 的地方改为挂一个回调。
+
+```cpp
+// 不需要任务：超时、取消、组合都交给 sender 算法
+auto item = ex::sync_wait(ex::when_any(
+    exec::async_recv(channel) | ex::then([](std::optional<Job> j) { return j; }),
+    exec::schedule_after(sf, 100ms) | ex::then([] { return std::optional<Job>{}; })));
+
+// 接受连接、读写；continues_on(sf) 之后的代码在任务里
+auto echo = exec::async_accept(*listener)
+          | ex::continues_on(sf)
+          | ex::then([](std::unique_ptr<io::TcpStream> s) { /* 任务里，可以阻塞式读写 */ });
+
+// 任务里照样能用 exec::wait 等它们
+exec::wait(exec::async_lock(mutex));     // 拿到锁后返回，记得 unlock()
+```
+
+| sender | 完成 |
+|---|---|
+| `async_lock(Mutex&)` / `async_acquire(Semaphore&)` / `async_wait(WaitGroup&)` | `set_value()` |
+| `async_send(Channel<T>&, v)` | `set_value(bool)`：false 表示 channel 已关闭 |
+| `async_recv(Channel<T>&)` / `async_next(Stream<T>&)` | `set_value(std::optional<T>)`：空表示已关闭且取完 |
+| `async_get(Completion<T>)` | `set_value(T)`，或 `set_error(error_code / exception_ptr)` |
+| `async_read` / `async_read_exactly` / `async_write` / `async_write_all` | `set_value(size_t)`，`set_error(error_code)`；参数是 `StreamSocket&` 或任意 `Registration&` |
+| `async_accept(TcpListener& / UnixListener&)`、`async_connect<TcpStream / UnixStream>(poller, addr)` | `set_value(std::unique_ptr<Stream>)` |
+| `async_recv` / `async_recv_from` / `async_send` / `async_send_to`（`UdpSocket&`） | `set_value(size_t)` |
+| `schedule_after(sf, d)` / `schedule_at(sf, t)` | `set_value()`，在 `sf` 的任务里 |
+
+- 能马上完成的在 `start()` 里同步完成，不注册停止回调；要等的在使它成立的那个线程上同步完成：释放锁、发送、`close()`、`set()` 的线程，或者轮询这个 fd 的 worker（在任务之外）。所以后续代码可能跑在这些线程上：需要在任务里运行就接 `continues_on(sf)`，或者在任务里 `exec::wait`。这与 stdexec 的约定一致。
+- 停止请求把等待摘掉并以 `set_stopped` 完成，除非它已经被满足：一个被停止的 `async_acquire` 不拿走许可，被停止的 `async_recv` 不消费元素，被停止的 `async_read` 不读数据。`async_write_all` / `async_read_exactly` 被停止时，已经搬运的字节不会报告。
+- 定时器到期后与 `schedule()` 一样起一个任务来完成，后续代码在任务里；`Scheduler::stop()` 立刻在调用线程上以 `set_stopped` 回调所有挂起的定时器，之后新的定时器直接完成为 stopped。IO 和同步原语上的等待不会被 `stop()` 清扫，要靠停止令牌取消。
+- 操作状态里放着等待者、定时器条目和停止回调，整条路径不分配。
+- 为此核心多了一种唤醒方式：`Waker` / `Waiter` 可以是一个回调，原语提供"尝试，不行就入队"和"取消"两个钩子（如 `Semaphore::acquireOrEnqueue` / `cancel`、`Registration::watch` / `unwatch`、`Scheduler::addCallbackTimer`）。回调在通知方释放锁之后运行，可以重入同一个原语，所以 `Semaphore::release`、`Channel::trySend/tryRecv`、`Stream::push` 改成了解锁后再通知；`Stream` 和 `Completion` 的唤醒变成一次性的。
+
 开销（`bench/ExecBench.cpp`，x86_64 release）：
 
 | 操作 | 每次 |
@@ -353,8 +390,12 @@ ex::sync_wait(ex::schedule(sf) | ex::then([] { /* 在 sf 的一个任务里：�
 | 对照：原生 `spawnJoinable` + `join`（JoinState 在堆上） | 103–116 ns |
 | 任务里 `wait(schedule(lexec 线程池))`：去了再回来 | 约 340 ns |
 | 普通线程上 `sync_wait(exec::spawn(fn))` | 约 2.0 µs（lexec 自己的 `sync_wait(schedule(pool))` 约 1.3–1.5 µs） |
+| `async_lock` + `unlock`，锁空闲（对照 `Mutex::lock` + `unlock` 一样是 11 ns） | 11 ns |
+| 两个任务经单槽 channel 乒乓，接收方 `wait(async_recv)`（对照 `recv()` 84–116 ns） | 64–69 ns |
+| `schedule_after` 启动再停止：加入、取消一个定时器 | 约 64 ns |
+| 两个任务经 Unix 套接字一字节往返，`wait(async_read/async_write)`（对照直接读写约 2.0 µs） | 约 2.0–2.4 µs |
 
-任务里等待 lexec 线程池上的 sender，整条路径不分配（有测试统计 `operator new`）。
+任务里等待 lexec 线程池上的 sender、等待原生 sender，整条路径都不分配（有测试统计 `operator new`）。
 
 ## 构建
 
@@ -479,6 +520,7 @@ IO 与定时器：
 - `Registration` 必须在 fd 关闭之前析构（声明顺序：先 `Fd`、后 `Registration`）。
 - 被 IO 唤醒的任务如果长时间占着 CPU，在它结束或 park 之前，其他连接的就绪事件可能没人收取：收到事件的 worker 自己跑第一个任务，轮询角色空出来，而其余空闲 worker 睡在各自的 futex 上，不会顶上去轮询（Tokio 同样如此）。实测一个每请求空转 20 ms 的处理函数旁边，另一条连接约 3.5% 的请求要等它跑完（Tokio 3.8%）。长计算交给 `blocking()`。
 - 管道仍用 `write`：写一个没有读端的管道会触发 SIGPIPE，需要进程自己忽略该信号。
+- 原生 IO sender 等到就绪后，后续代码在轮询它的 worker 上、任务之外运行：在那里调用会阻塞的接口（`Mutex::lock`、`Channel::recv`、`sync_wait`）会卡住整个 worker，先 `continues_on(sf)` 进任务。
 - Unix 域 `connect` 遇到监听方积压队列已满时返回 `resource_unavailable_try_again`，连接并未排队，稍后重试。
 - `ConditionVariable::wait` 被强制展开时只能 `tryLock` 尽力重新持锁；持锁方若也在被回收则互斥量状态未定义——这只发生在 `stop()`。
 - `sleepFor` 只能在任务内调用；1 个 worker 且任务从不 `yield` 时定时器无法触发（协作式无抢占）。

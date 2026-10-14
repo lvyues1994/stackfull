@@ -113,6 +113,14 @@ struct SchedulerCore {
     // Queue a deadline on the calling worker (tasks only); wakes the
     // timekeeper if it sleeps past it.
     void addTimer(TimerEntry &entry) noexcept;
+    // Timers that call back (stackfull::exec), from any thread: set
+    // entry.queue to callbackTimerQueue() — the calling worker's, else worker
+    // 0's — before anything may cancel the entry, then addCallbackTimer().
+    // False if it was not queued: cancelled first, or stop() has begun.
+    TimerQueue &callbackTimerQueue() noexcept;
+    bool addCallbackTimer(TimerEntry &entry) noexcept;
+    // stop(): call every callback timer back now, refuse further ones.
+    void fireCallbackTimersAndClose() noexcept;
     // Fire what is due on every worker's queue; any worker may call this.
     void fireTimers() noexcept;
     // Earliest deadline across all workers' queues, without locking.

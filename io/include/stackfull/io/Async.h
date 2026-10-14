@@ -76,36 +76,62 @@ inline std::error_code waitNewer(Registration &registration, Interest const dire
 
 } // namespace detail
 
-// The loop behind every transfer above, for other non-blocking system calls
-// on a registered descriptor (recvfrom, recvmmsg, ...). Calls `call` — which
-// returns ssize_t, or -1 with errno — until it succeeds, fails with
-// something other than EINTR/EAGAIN, or `deadline` (null: none) passes while
-// waiting for `direction`. The event count is read before each call, so a
-// report landing between the call and the wait is not lost. `asked` is the
-// byte count requested: on a byte stream a shorter success lets the next
-// call wait without asking the kernel (Registration::setKind).
+// One attempt that never waits, for operations that wait their own way
+// (stackfull::exec): read the direction's event count as `seen` first; on
+// `wouldBlock`, wait for a report newer than `seen` and try again.
+struct IoAttempt {
+    std::size_t bytes = 0;
+    std::error_code error;
+    bool wouldBlock = false;
+};
+
+inline std::uint32_t eventsOf(Registration const &registration, Interest const direction) noexcept {
+    return direction == Interest::Readable ? registration.readEvents() : registration.writeEvents();
+}
+
+// One non-blocking system call on a registered descriptor: `call` returns
+// ssize_t, or -1 with errno; EINTR is retried. `asked` is the byte count
+// requested: on a byte stream a shorter success makes the next attempt wait
+// without asking the kernel (Registration::setKind) — `wouldBlock` at once.
 template <class Call>
-IoResult callWhenReady(Registration &registration, Interest const direction, std::size_t const asked,
-                       Deadline const *const deadline, Call const &call) {
+IoAttempt tryCall(Registration &registration, Interest const direction, std::size_t const asked,
+                  std::uint32_t const seen, Call const &call) {
+    if (registration.exhausted(direction, seen)) {
+        return IoAttempt{0, std::error_code{}, true};
+    }
     for (;;) {
-        std::uint32_t const seen =
-            direction == Interest::Readable ? registration.readEvents() : registration.writeEvents();
-        if (registration.exhausted(direction, seen)) {
-            if (std::error_code const error = detail::waitNewer(registration, direction, seen, deadline)) {
-                return IoResult{0, error};
-            }
-            continue;
-        }
         auto const n = call();
         if (n >= 0) {
             registration.noteTransfer(direction, seen, static_cast<std::size_t>(n), asked);
-            return IoResult{static_cast<std::size_t>(n), std::error_code{}};
+            return IoAttempt{static_cast<std::size_t>(n), std::error_code{}, false};
         }
         if (errno == EINTR) {
             continue;
         }
-        if (errno != EAGAIN and errno != EWOULDBLOCK) {
-            return IoResult{0, lastError()};
+        if (errno == EAGAIN or errno == EWOULDBLOCK) {
+            return IoAttempt{0, std::error_code{}, true};
+        }
+        return IoAttempt{0, lastError(), false};
+    }
+}
+
+// read() / write() / accept() as one attempt each.
+IoAttempt tryRead(Registration &registration, std::uint32_t seen, void *buffer, std::size_t length);
+IoAttempt tryWrite(Registration &registration, std::uint32_t seen, void const *buffer, std::size_t length);
+AcceptResult tryAccept(Registration &listener, bool &wouldBlock);
+
+// Repeats `attempt(seen)` — returning an IoAttempt — until it does not
+// block, waiting for `direction` in between, or `deadline` (null: none)
+// passes while waiting. The event count is read before each attempt, so a
+// report landing between the attempt and the wait is not lost.
+template <class Attempt>
+IoResult retryWhenReady(Registration &registration, Interest const direction, Deadline const *const deadline,
+                        Attempt const &attempt) {
+    for (;;) {
+        std::uint32_t const seen = eventsOf(registration, direction);
+        IoAttempt const result = attempt(seen);
+        if (not result.wouldBlock) {
+            return IoResult{result.bytes, result.error};
         }
         if (std::error_code const error = detail::waitNewer(registration, direction, seen, deadline)) {
             return IoResult{0, error};
@@ -113,9 +139,30 @@ IoResult callWhenReady(Registration &registration, Interest const direction, std
     }
 }
 
+// The loop behind every transfer above, for other non-blocking system calls
+// on a registered descriptor (recvfrom, recvmmsg, ...): tryCall() until it
+// does not hit EAGAIN.
+template <class Call>
+IoResult callWhenReady(Registration &registration, Interest const direction, std::size_t const asked,
+                       Deadline const *const deadline, Call const &call) {
+    return retryWhenReady(registration, direction, deadline, [&](std::uint32_t const seen) {
+        return tryCall(registration, direction, asked, seen, call);
+    });
+}
+
 // Non-blocking connect: starts it, waits for writability, reports SO_ERROR.
+// Registering an unconnected TCP socket reports it writable (and hung up)
+// at once, which these may take for the handshake's end: prefer starting
+// the connect before registering, as below.
 std::error_code connect(Registration &registration, sockaddr const *address, socklen_t length);
 std::error_code connectUntil(Registration &registration, sockaddr const *address, socklen_t length, Deadline deadline);
+
+// Connecting in two steps, around registering the socket: startConnect()
+// on the bare descriptor (no error and not `inProgress`: connected), then
+// register it, wait for its first write report, and finishConnect() for the
+// outcome.
+std::error_code startConnect(int fd, sockaddr const *address, socklen_t length, bool &inProgress) noexcept;
+std::error_code finishConnect(int fd) noexcept;
 
 } // namespace io
 } // namespace stackfull

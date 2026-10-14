@@ -62,12 +62,15 @@ struct Channel {
     }
 
     bool trySend(T value) {
-        SpinLockGuard const guard(lock);
+        lock.lock();
         if (closed or count == capacity) {
+            lock.unlock();
             return false;
         }
         pushLocked(std::move(value));
-        if (detail::Waiter *const receiver = receivers.popFront()) {
+        detail::Waiter *const receiver = receivers.popFront();
+        lock.unlock();
+        if (receiver != nullptr) {
             receiver->notify();
         }
         return true;
@@ -100,15 +103,70 @@ struct Channel {
     }
 
     bool tryRecv(T &out) {
-        SpinLockGuard const guard(lock);
+        lock.lock();
         if (count == 0) {
+            lock.unlock();
             return false;
         }
         out = popLocked();
-        if (detail::Waiter *const sender = senders.popFront()) {
+        detail::Waiter *const sender = senders.popFront();
+        lock.unlock();
+        if (sender != nullptr) {
             sender->notify();
         }
         return true;
+    }
+
+    // send() for a callback waiter (stackfull::exec); a null waiter only
+    // tries. Moves from `value` only when Done; after an Enqueued the
+    // callback means: try again.
+    detail::TransferResult sendOrEnqueue(T &value, detail::Waiter *const waiter) {
+        lock.lock();
+        if (closed) {
+            lock.unlock();
+            return detail::TransferResult::Closed;
+        }
+        if (count < capacity) {
+            pushLocked(std::move(value));
+            detail::Waiter *const receiver = receivers.popFront();
+            lock.unlock();
+            if (receiver != nullptr) {
+                receiver->notify();
+            }
+            return detail::TransferResult::Done;
+        }
+        detail::TransferResult const result = enqueueLocked(senders, waiter);
+        lock.unlock();
+        return result;
+    }
+
+    // recv() for a callback waiter: hands the value to `sink(T &&)`, called
+    // under the lock, when Done.
+    template <class Sink>
+    detail::TransferResult recvOrEnqueue(Sink &&sink, detail::Waiter *const waiter) {
+        lock.lock();
+        if (count != 0) {
+            sink(popLocked());
+            detail::Waiter *const sender = senders.popFront();
+            lock.unlock();
+            if (sender != nullptr) {
+                sender->notify();
+            }
+            return detail::TransferResult::Done;
+        }
+        detail::TransferResult const result = closed ? detail::TransferResult::Closed : enqueueLocked(receivers, waiter);
+        lock.unlock();
+        return result;
+    }
+
+    // True if `waiter` was queued and now is not.
+    bool cancelSend(detail::Waiter &waiter) noexcept {
+        SpinLockGuard const guard(lock);
+        return detail::cancelWaiter(senders, waiter);
+    }
+    bool cancelRecv(detail::Waiter &waiter) noexcept {
+        SpinLockGuard const guard(lock);
+        return detail::cancelWaiter(receivers, waiter);
     }
 
     void close() noexcept {
@@ -146,6 +204,17 @@ private:
     using Slot = typename std::aligned_storage<sizeof(T), alignof(T)>::type;
 
     T *slotAt(std::size_t const index) noexcept { return reinterpret_cast<T *>(&slots[index]); }
+
+    static detail::TransferResult enqueueLocked(detail::WaitList &list, detail::Waiter *const waiter) noexcept {
+        if (waiter == nullptr) {
+            return detail::TransferResult::WouldBlock;
+        }
+        if (waiter->cancelled) {
+            return detail::TransferResult::Cancelled;
+        }
+        list.pushBack(*waiter);
+        return detail::TransferResult::Enqueued;
+    }
 
     void pushLocked(T &&value) {
         ::new (static_cast<void *>(&slots[(head + count) % capacity])) T(std::move(value));

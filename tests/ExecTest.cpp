@@ -4,6 +4,8 @@
 
 #include <stackfull/sched/Scheduler.h>
 #include <stackfull/sched/ThisTask.h>
+#include <stackfull/sync/Channel.h>
+#include <stackfull/sync/Mutex.h>
 #include <stackfull/sync/WaitGroup.h>
 
 #include <gtest/gtest.h>
@@ -286,6 +288,34 @@ TEST(ExecWait, AllocatesNothing) {
         counted = allocations.load();
     });
     EXPECT_EQ(counterWorks, 1);
+    EXPECT_EQ(counted, 0);
+}
+
+// The native senders keep their waits (waiter, timer entry, stop callback)
+// in the operation state.
+TEST(ExecWait, NativeSendersAllocateNothing) {
+    auto scheduler = schedulerWith(1);
+    exec::scheduler const sf{*scheduler};
+    stackfull::sync::Mutex mutex;
+    stackfull::sync::Channel<int> channel{1};
+    auto const round = [&] {
+        exec::wait(exec::schedule_after(sf, std::chrono::microseconds{1}));
+        exec::wait(exec::async_lock(mutex));
+        mutex.unlock();
+        exec::wait(exec::async_send(channel, 1));
+        exec::wait(exec::async_recv(channel));
+    };
+    runInTask(*scheduler, round);
+    long counted = -1;
+    runInTask(*scheduler, [&] {
+        allocations.store(0);
+        countingAllocations.store(true);
+        for (int i = 0; i < 50; ++i) {
+            round();
+        }
+        countingAllocations.store(false);
+        counted = allocations.load();
+    });
     EXPECT_EQ(counted, 0);
 }
 

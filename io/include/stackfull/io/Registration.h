@@ -62,6 +62,14 @@ struct Registration {
     std::error_code waitReadable();
     std::error_code waitWritable();
 
+    // The counted wait for a callback waiter (stackfull::exec): Ready if a
+    // report newer than `seen` already arrived, else Enqueued until one
+    // does (the callback runs on the polling thread), or Cancelled if
+    // unwatch() came first. Requires error() to be empty.
+    sync::detail::EnqueueResult watch(Interest direction, std::uint32_t seen, sync::detail::Waiter &waiter) noexcept;
+    // True if `waiter` was waiting and now is not.
+    bool unwatch(Interest direction, sync::detail::Waiter &waiter) noexcept;
+
     // What the descriptor is; the transfer functions (Async.h) go by it.
     //   - Sockets are read and written with recv/send: no file-permission
     //     hooks on every call (AppArmor, SELinux), and a write to a reset

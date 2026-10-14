@@ -47,5 +47,25 @@ void WaitGroup::wait() {
     unlinkOnUnwind.disarm();
 }
 
+detail::EnqueueResult WaitGroup::waitOrEnqueue(detail::Waiter &waiter) noexcept {
+    if (pending.load(std::memory_order_acquire) == 0) {
+        return detail::EnqueueResult::Ready;
+    }
+    SpinLockGuard const guard(lock);
+    if (waiter.cancelled) {
+        return detail::EnqueueResult::Cancelled;
+    }
+    if (pending.load(std::memory_order_acquire) == 0) {
+        return detail::EnqueueResult::Ready;
+    }
+    waiters.pushBack(waiter);
+    return detail::EnqueueResult::Enqueued;
+}
+
+bool WaitGroup::cancel(detail::Waiter &waiter) noexcept {
+    SpinLockGuard const guard(lock);
+    return detail::cancelWaiter(waiters, waiter);
+}
+
 } // namespace sync
 } // namespace stackfull

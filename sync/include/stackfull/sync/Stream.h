@@ -50,16 +50,13 @@ struct Stream {
 
     // Never blocks. Dropped silently after close() or per the policy.
     void push(T value) {
-        SpinLockGuard const guard(lock);
-        if (closed) {
+        lock.lock();
+        if (closed or (count == capacity and policy == Overflow::DropNewest)) {
+            lock.unlock();
             droppedCount.fetch_add(1, std::memory_order_relaxed);
             return;
         }
         if (count == capacity) {
-            if (policy == Overflow::DropNewest) {
-                droppedCount.fetch_add(1, std::memory_order_relaxed);
-                return;
-            }
             slotAt(head)->~T(); // DropOldest
             head = (head + 1) % capacity;
             --count;
@@ -67,16 +64,16 @@ struct Stream {
         }
         ::new (static_cast<void *>(&slots[(head + count) % capacity])) T(std::move(value));
         ++count;
-        consumer.wake(); // a Waker by value: harmless if the consumer moved on
+        detail::Waker const toWake = takeConsumerLocked();
+        lock.unlock();
+        toWake.wake(); // a Waker by value: harmless if the consumer moved on
     }
 
     void close() noexcept {
-        detail::Waker toWake;
-        {
-            SpinLockGuard const guard(lock);
-            closed = true;
-            toWake = consumer;
-        }
+        lock.lock();
+        closed = true;
+        detail::Waker const toWake = takeConsumerLocked();
+        lock.unlock();
         toWake.wake();
     }
 
@@ -173,8 +170,49 @@ struct Stream {
         }
     }
 
+    // next() for a callback waiter (stackfull::exec); a null waiter only
+    // tries. Hands the item to `sink(T &&)`, called under the lock, when
+    // Done; Closed once closed and drained; after an Enqueued the callback
+    // means: try again.
+    template <class Sink>
+    detail::TransferResult nextOrAttach(Sink &&sink, detail::Waiter *const waiter) {
+        SpinLockGuard const guard(lock);
+        if (count != 0) {
+            sink(popLocked());
+            return detail::TransferResult::Done;
+        }
+        if (closed) {
+            return detail::TransferResult::Closed;
+        }
+        if (waiter == nullptr) {
+            return detail::TransferResult::WouldBlock;
+        }
+        if (waiter->cancelled) {
+            return detail::TransferResult::Cancelled;
+        }
+        consumer = waiter->waker();
+        return detail::TransferResult::Enqueued;
+    }
+    // True if `waiter` was attached and now is not.
+    bool cancel(detail::Waiter &waiter) noexcept {
+        SpinLockGuard const guard(lock);
+        if (consumer == waiter.waker()) {
+            consumer.clear();
+            return true;
+        }
+        waiter.cancelled = true;
+        return false;
+    }
+
 private:
     using Slot = typename std::aligned_storage<sizeof(T), alignof(T)>::type;
+
+    // A wake is one-shot: a callback waiter must not be called twice.
+    detail::Waker takeConsumerLocked() noexcept {
+        detail::Waker const taken = consumer;
+        consumer.clear();
+        return taken;
+    }
 
     struct DetachOnExit {
         Stream &stream;

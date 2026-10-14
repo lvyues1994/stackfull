@@ -56,17 +56,12 @@ std::error_code Registration::waitFor(Interest const direction, std::uint32_t co
     }
     sync::detail::Waiter waiter;
     sync::detail::Waker const me = waiter.waker();
-    Interest armed = Interest::None;
     {
         sync::SpinLockGuard const guard(lock);
         if (mine.events.load(std::memory_order_relaxed) != seen) {
             return std::error_code{}; // a report landed first: nothing to wait for
         }
         mine.waker = me;
-        // Pollers without edge triggering watch one-shot: arm for everything
-        // anyone waits on, so the other direction's waiter is not disarmed.
-        armed = (read.waker.isEmpty() ? Interest::None : Interest::Readable) |
-                (write.waker.isEmpty() ? Interest::None : Interest::Writable);
     }
     // From here the count only moves in collect(), which takes our waker in
     // the same critical section. Leaving before that (timeout, error, forced
@@ -83,7 +78,7 @@ std::error_code Registration::waitFor(Interest const direction, std::uint32_t co
         }
     } detach{*this, direction, me};
     if (not everyArrivalReported) {
-        if (std::error_code const error = owner.arm(*this, armed)) {
+        if (std::error_code const error = owner.arm(*this, direction)) {
             return error;
         }
     }
@@ -101,6 +96,38 @@ std::error_code Registration::waitFor(Interest const direction, std::uint32_t co
     }
     detach.taken = true;
     return std::error_code{};
+}
+
+sync::detail::EnqueueResult Registration::watch(Interest const direction, std::uint32_t const seen,
+                                                sync::detail::Waiter &waiter) noexcept {
+    Direction &mine = slot(direction);
+    if (not everyArrivalReported) {
+        // Before the waker is stored, not after as in waitFor(): once it is,
+        // the callback may complete the operation and destroy this
+        // registration. A report that arming brings in early moves the count
+        // past `seen`, which the check below sees.
+        static_cast<void>(owner.arm(*this, direction)); // fails only when add() did
+    }
+    sync::SpinLockGuard const guard(lock);
+    if (waiter.cancelled) {
+        return sync::detail::EnqueueResult::Cancelled;
+    }
+    if (mine.events.load(std::memory_order_relaxed) != seen) {
+        return sync::detail::EnqueueResult::Ready;
+    }
+    mine.waker = waiter.waker();
+    return sync::detail::EnqueueResult::Enqueued;
+}
+
+bool Registration::unwatch(Interest const direction, sync::detail::Waiter &waiter) noexcept {
+    sync::SpinLockGuard const guard(lock);
+    sync::detail::Waker &waiting = slot(direction).waker;
+    if (waiting == waiter.waker()) {
+        waiting.clear();
+        return true;
+    }
+    waiter.cancelled = true;
+    return false;
 }
 
 void Registration::detach(Interest const direction, sync::detail::Waker const &waker) noexcept {

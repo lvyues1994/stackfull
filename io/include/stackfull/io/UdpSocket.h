@@ -94,6 +94,12 @@ struct UdpSocket {
     // again with the rest.
     BatchResult sendMany(Datagram const *datagrams, std::size_t count);
 
+    // One attempt each, never waiting, for operations that wait their own
+    // way (stackfull::exec); see io::IoAttempt. `to` null: the connected
+    // peer; `from` null: the sender is not wanted.
+    IoAttempt trySend(std::uint32_t seen, void const *data, std::size_t length, SocketAddress const *to);
+    IoAttempt tryRecv(std::uint32_t seen, void *buffer, std::size_t length, SocketAddress *from);
+
     std::error_code setBroadcast(bool enabled) noexcept;
     SocketAddress localAddress() const noexcept;
     int fd() const noexcept { return socket.get(); }

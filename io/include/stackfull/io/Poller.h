@@ -34,14 +34,16 @@ inline bool has(Interest const set, Interest const bit) noexcept {
 //   - edge-triggered (epoll): both directions are watched from add() on and
 //     every edge is reported; arm() does nothing, so waits cost no system
 //     call beyond the one that hit EAGAIN;
-//   - one-shot (poll): arm() watches the given directions until the next
-//     report for the descriptor.
+//   - one-shot (poll): arm() adds directions to those watched; each is
+//     dropped again once reported.
 struct Poller : sched::Driver {
     // Start tracking `registration.fd()`.
     virtual std::error_code add(Registration &registration) noexcept = 0;
     // Stop tracking; after this returns no further readiness is delivered.
     virtual void remove(Registration &registration) noexcept = 0;
-    // Called before each wait with the directions someone waits on.
+    // Called before each wait with the direction(s) about to be waited on.
+    // Adds to what is watched, so waiters in the two directions cannot undo
+    // each other's arming.
     virtual std::error_code arm(Registration &registration, Interest interest) noexcept = 0;
     // True if every arrival of data (or buffer space) is reported, even
     // while the previous report has not been acted on: edge triggering.

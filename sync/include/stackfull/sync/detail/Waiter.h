@@ -6,41 +6,62 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 
 namespace stackfull {
 namespace sync {
 namespace detail {
 
-// Value handle for waking a blocked party: a task's WakeToken, or a plain
-// thread's Parker. Safe to keep after the party moved on — waking a task
-// that no longer waits (or no longer exists) is a no-op or a spurious wake,
-// which every wait loop tolerates. Event sources that outlive their
-// awaiters (Completion, Stream, Mailbox) store this instead of a pointer to
-// a stack-resident Waiter, so even a task released without unwinding
-// (no-exceptions builds) leaves nothing dangling behind. The one thing a
-// stale token still needs is the Scheduler it belongs to: keep schedulers
-// alive for as long as callbacks may arrive (the default one is immortal).
+// The third way to wait, beside a task and a thread: a function to call
+// (how stackfull::exec's operations wait). It runs on the notifying thread
+// once the notifier has released its locks, and may complete — and so
+// destroy — whatever owns the waiter. A callback waiter is woken once:
+// sources take it when they wake it. Must not throw; not spelled noexcept
+// because that changes the type's mangling between C++14 and C++17.
+using WakeCallback = void (*)(void *argument);
+
+// Value handle for waking a blocked party: a task's WakeToken, a plain
+// thread's Parker, or a callback. Safe to keep after a task or thread moved
+// on — waking a task that no longer waits (or no longer exists) is a no-op
+// or a spurious wake, which every wait loop tolerates. Event sources that
+// outlive their awaiters (Completion, Stream, Mailbox) store this instead of
+// a pointer to a stack-resident Waiter, so even a task released without
+// unwinding (no-exceptions builds) leaves nothing dangling behind. The one
+// thing a stale token still needs is the Scheduler it belongs to: keep
+// schedulers alive for as long as callbacks may arrive (the default one is
+// immortal).
 struct Waker {
     sched::WakeToken token{};
     sched::Parker *parker = nullptr;
+    WakeCallback callback = nullptr;
+    void *argument = nullptr;
 
     void wake() const noexcept {
-        if (parker != nullptr) {
+        if (callback != nullptr) {
+            callback(argument);
+        } else if (parker != nullptr) {
             parker->unpark();
         } else if (token) {
             token.wake();
         }
     }
-    bool isEmpty() const noexcept { return parker == nullptr and not token; }
-    void clear() noexcept {
-        parker = nullptr;
-        token = sched::WakeToken{};
-    }
+    bool isEmpty() const noexcept { return callback == nullptr and parker == nullptr and not token; }
+    void clear() noexcept { *this = Waker{}; }
     friend bool operator==(Waker const &a, Waker const &b) noexcept {
-        return a.parker == b.parker and a.token.core == b.token.core and a.token.slot == b.token.slot and
-               a.token.generation == b.token.generation;
+        return a.callback == b.callback and a.argument == b.argument and a.parker == b.parker and
+               a.token.core == b.token.core and a.token.slot == b.token.slot and a.token.generation == b.token.generation;
     }
 };
+
+// Queueing a callback waiter with a primitive: no need to wait (try the
+// operation now), queued (the callback comes), or the primitive's cancel()
+// came first (complete as stopped).
+enum class EnqueueResult : std::uint8_t { Ready, Enqueued, Cancelled };
+
+// The same for operations that move a value (Channel, Stream): it moved,
+// the source is closed, it would wait but no waiter was given (an attempt
+// only), queued, or cancelled first.
+enum class TransferResult : std::uint8_t { Done, Closed, WouldBlock, Enqueued, Cancelled };
 
 // One blocked party, living on the waiter's own stack (coroutine or OS
 // thread) for as long as it is linked into a primitive's WaitList. Works for
@@ -59,12 +80,19 @@ struct Waiter {
     bool linked = false;
     std::atomic<bool> satisfied{false};
 
-    // Exactly one of the two is set.
+    // Exactly one of the three is set.
     sched::WakeToken token{};
     sched::Parker *parker = nullptr;
+    WakeCallback callback = nullptr;
+    void *argument = nullptr;
+    // Callback waiters: a cancel() found the waiter not queued, so the next
+    // enqueue refuses it. Read and written under the primitive's lock.
+    bool cancelled = false;
 
     // Binds to the calling context: the current task, or this OS thread.
     Waiter() noexcept;
+    // A callback waiter (see WakeCallback); wait() and block() do not apply.
+    Waiter(WakeCallback const callback_, void *const argument_) noexcept : callback(callback_), argument(argument_) {}
     Waiter(Waiter const &) = delete;
     Waiter &operator=(Waiter const &) = delete;
 
@@ -79,10 +107,15 @@ struct Waiter {
     void block();
     bool blockUntil(std::chrono::steady_clock::time_point deadline);
 
-    Waker waker() const noexcept { return Waker{token, parker}; }
+    Waker waker() const noexcept { return Waker{token, parker, callback, argument}; }
 
-    // Called by the notifier after unlinking the waiter.
+    // Called by the notifier after unlinking the waiter, outside its locks.
     void notify() noexcept {
+        if (callback != nullptr) {
+            WakeCallback const f = callback;
+            f(argument); // may destroy this waiter
+            return;
+        }
         if (parker != nullptr) {
             sched::Parker *const p = parker;
             satisfied.store(true, std::memory_order_release);
@@ -194,6 +227,19 @@ private:
 struct NoOp {
     void operator()() const noexcept {}
 };
+
+// cancel() for a callback waiter on a WaitList, under the primitive's lock:
+// true if it was queued and now is not (the caller completes it as
+// stopped); otherwise it is marked so that its next enqueue is refused —
+// or it was already taken by a notifier, whose callback is on its way.
+inline bool cancelWaiter(WaitList &list, Waiter &waiter) noexcept {
+    if (waiter.linked) {
+        list.unlink(waiter);
+        return true;
+    }
+    waiter.cancelled = true;
+    return false;
+}
 
 } // namespace detail
 } // namespace sync

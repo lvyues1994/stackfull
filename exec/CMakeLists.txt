@@ -17,4 +17,4 @@ add_library(stackfull::exec ALIAS stackfull_exec)
 
 target_include_directories(stackfull_exec INTERFACE include)
 target_compile_features(stackfull_exec INTERFACE cxx_std_17)
-target_link_libraries(stackfull_exec INTERFACE stackfull::sched lexec::lexec)
+target_link_libraries(stackfull_exec INTERFACE stackfull::sched stackfull::sync stackfull::io lexec::lexec)

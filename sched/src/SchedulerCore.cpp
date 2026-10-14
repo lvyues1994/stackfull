@@ -220,6 +220,38 @@ void SchedulerCore::addTimer(TimerEntry &entry) noexcept {
     }
 }
 
+TimerQueue &SchedulerCore::callbackTimerQueue() noexcept {
+    Worker *const me = currentWorker();
+    return me != nullptr and &me->core == this ? me->timers : workers[0]->timers;
+}
+
+// addTimer()'s protocol, from any thread. Without a timekeeper, a worker of
+// ours with nothing else to do claims the role on its way to sleep; anyone
+// else gets an idle worker to do so.
+bool SchedulerCore::addCallbackTimer(TimerEntry &entry) noexcept {
+    std::int64_t const deadline = ticksOf(entry.deadline); // once queued, the entry may fire and be gone
+    if (not entry.queue->addUnlessCancelled(entry)) {
+        return false;
+    }
+    if (Worker *const keeper = timekeeper.load(std::memory_order_seq_cst)) {
+        if (deadline < keeperDeadline.load(std::memory_order_seq_cst)) {
+            unparkWorker(*keeper);
+        }
+        return true;
+    }
+    Worker *const me = currentWorker();
+    if (me == nullptr or &me->core != this or me->hasLocalWork()) {
+        ensureTimekeeper();
+    }
+    return true;
+}
+
+void SchedulerCore::fireCallbackTimersAndClose() noexcept {
+    for (auto const &worker : workers) {
+        worker->timers.fireCallbacksAndClose();
+    }
+}
+
 // A worker woken here may find leftover work before it gets to claim the
 // role, and would then call this again from its own dispatch: without a
 // limit, one burst wakes worker after worker. So at most one such wakeup
