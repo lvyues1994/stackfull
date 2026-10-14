@@ -23,6 +23,7 @@ namespace {
 
 struct SchedulerImpl final : Scheduler {
     explicit SchedulerImpl(SchedulerOptions const &options) : core_(options) {
+        core_.facade = this;
         // Running from the start. Worker 0 stays reserved when the caller
         // wants to be a worker; run() supplies it.
         launchFrom(options.callerIsWorker ? 1 : 0);

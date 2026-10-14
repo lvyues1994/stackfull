@@ -8,6 +8,9 @@
 
 namespace stackfull {
 namespace sched {
+
+struct TaskContext;
+
 namespace detail {
 
 struct Worker;
@@ -50,6 +53,12 @@ struct Task : coro::detail::ContextBlock {
     // When it was last made runnable (steady_clock ticks), with
     // SchedulerOptions::recordWakeLatency; 0 otherwise.
     std::int64_t readyAt = 0;
+    // this_task::context().
+    TaskContext *context = nullptr;
+    // Live this_task::NoForcedStop guards. Only the task writes it; the park
+    // that follows publishes it to a reaper, which reads it after claiming
+    // the task.
+    std::atomic<std::uint8_t> forcedStopShields{0};
 
     TaskState parkStateNow(std::memory_order const order = std::memory_order_acquire) const noexcept {
         return static_cast<TaskState>(parkState.load(order));

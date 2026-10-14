@@ -38,8 +38,9 @@ struct JoinableSpawnResult {
 //            begins to fail, every parked task is woken once so cooperative
 //            code sees this_task::stopRequested(), and tasks still parked
 //            afterwards are unwound (ForcedUnwind) — or, without exceptions,
-//            released without running their destructors. Workers exit when
-//            no task is left. A task that never parks cannot be stopped.
+//            released without running their destructors — unless they hold
+//            a this_task::NoForcedStop. Workers exit when no task is left.
+//            A task that never parks cannot be stopped.
 //
 // The destructor requests stop() and joins the background threads.
 struct Scheduler {

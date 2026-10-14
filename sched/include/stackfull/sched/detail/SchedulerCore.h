@@ -19,6 +19,9 @@
 
 namespace stackfull {
 namespace sched {
+
+struct Scheduler;
+
 namespace detail {
 
 struct Worker;
@@ -125,6 +128,8 @@ struct SchedulerCore {
     void requestRampUp() noexcept;
 
     SchedulerOptions options;
+    // The Scheduler this core belongs to (this_task::scheduler()).
+    Scheduler *facade = nullptr;
     stack::StackAllocator *allocator = nullptr;
 #if STACKFULL_HAS_EXCEPTIONS
     ExceptionSink *exceptionSink = nullptr;

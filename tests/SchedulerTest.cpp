@@ -812,6 +812,98 @@ TEST(Scheduler, StopWakesParkedTasksOnce) {
     EXPECT_EQ(exited.load(), 4);
 }
 
+// A task holding NoForcedStop is woken by stop() but never unwound or
+// dropped where it parks: it leaves when it is done, and only then do the
+// workers run out of tasks.
+TEST(Scheduler, NoForcedStopKeepsAParkedTaskUntilItLeaves) {
+    auto scheduler = makeScheduler(withWorkers(2));
+    WakeToken token;
+    std::atomic<bool> parked{false};
+    std::atomic<bool> sawStop{false};
+    std::atomic<bool> release{false};
+    std::atomic<bool> leftNormally{false};
+    ASSERT_TRUE(scheduler->spawn([&] {
+        {
+            this_task::NoForcedStop const shield;
+            token = this_task::token();
+            parked.store(true);
+            while (not release.load()) {
+                this_task::park();
+                if (this_task::stopRequested()) {
+                    sawStop.store(true);
+                }
+            }
+        }
+        leftNormally.store(true);
+    }));
+    while (not parked.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds{5});
+    scheduler->stop();
+    std::this_thread::sleep_for(std::chrono::milliseconds{50}); // workers rescan every millisecond
+    EXPECT_TRUE(sawStop.load());
+    EXPECT_EQ(scheduler->liveTasks(), 1u);
+    EXPECT_FALSE(leftNormally.load());
+    release.store(true);
+    token.wake();
+    ASSERT_TRUE(waitIdle(*scheduler));
+    EXPECT_TRUE(leftNormally.load());
+}
+
+TEST(Scheduler, ThisTaskKnowsItsSchedulerAndContext) {
+    auto scheduler = makeScheduler(withWorkers(2));
+    struct Record : TaskContext {};
+    std::atomic<bool> done{false};
+    Scheduler *seen = nullptr;
+    bool startsEmpty = false;
+    bool roundTrip = false;
+    ASSERT_TRUE(scheduler->spawn([&] {
+        startsEmpty = this_task::context() == nullptr;
+        Record record;
+        this_task::setContext(&record);
+        roundTrip = this_task::context() == &record;
+        this_task::setContext(nullptr);
+        seen = &this_task::scheduler();
+        done.store(true);
+    }));
+    while (not done.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+    EXPECT_EQ(seen, scheduler.get());
+    EXPECT_TRUE(startsEmpty);
+    EXPECT_TRUE(roundTrip);
+}
+
+#if !STACKFULL_HAS_EXCEPTIONS
+// Without exceptions a dropped task's stack is released as is; its context
+// hears about it first.
+TEST(Scheduler, StopTellsTheContextOfATaskItDrops) {
+    auto scheduler = makeScheduler(withWorkers(2));
+    struct Record : TaskContext {
+        std::atomic<int> *dropped = nullptr;
+    };
+    std::atomic<int> dropped{0};
+    std::atomic<bool> parked{false};
+    ASSERT_TRUE(scheduler->spawn([&] {
+        Record record;
+        record.dropped = &dropped;
+        record.onDropped = [](TaskContext &context) noexcept { static_cast<Record &>(context).dropped->fetch_add(1); };
+        this_task::setContext(&record);
+        parked.store(true);
+        for (;;) {
+            this_task::park(); // never leaves on its own
+        }
+    }));
+    while (not parked.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+    scheduler->stop();
+    ASSERT_TRUE(waitIdle(*scheduler));
+    EXPECT_EQ(dropped.load(), 1);
+}
+#endif
+
 // stop() wakes every parked task once before unwinding the ones still
 // parked; workers that are already busy running the first woken tasks must
 // not reap the rest before their wake has been delivered.

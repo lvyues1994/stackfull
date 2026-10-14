@@ -2,6 +2,7 @@
 
 #include <stackfull/coro/Config.h>
 #include <stackfull/coro/detail/Switch.h>
+#include <stackfull/sched/TaskContext.h>
 #include <stackfull/sched/WakeToken.h>
 #include <stackfull/sched/detail/Runtime.h>
 
@@ -95,6 +96,41 @@ inline bool isTask() noexcept {
 inline std::size_t workerIndex() noexcept {
     return detail::currentTask().worker.index;
 }
+
+// The Scheduler running the calling task.
+inline Scheduler &scheduler() noexcept {
+    return *detail::currentTask().task.scheduler->facade;
+}
+
+// One integration's record for the calling task (see TaskContext), or null.
+inline TaskContext *context() noexcept {
+    return detail::currentTask().task.context;
+}
+
+inline void setContext(TaskContext *const context) noexcept {
+    detail::currentTask().task.context = context;
+}
+
+// While one is alive, Scheduler::stop() still wakes the calling task once
+// but never unwinds it (nor, without exceptions, drops it) where it parks.
+// For frames holding what others still use — an operation started on
+// another thread, completion code that must run to its end — and that leave
+// on their own once they see stopRequested(). Nestable; task-only.
+struct NoForcedStop {
+    NoForcedStop() noexcept : task(detail::currentTask().task) {
+        task.forcedStopShields.store(static_cast<std::uint8_t>(task.forcedStopShields.load(std::memory_order_relaxed) + 1),
+                                     std::memory_order_relaxed);
+    }
+    ~NoForcedStop() {
+        task.forcedStopShields.store(static_cast<std::uint8_t>(task.forcedStopShields.load(std::memory_order_relaxed) - 1),
+                                     std::memory_order_relaxed);
+    }
+    NoForcedStop(NoForcedStop const &) = delete;
+    NoForcedStop &operator=(NoForcedStop const &) = delete;
+
+private:
+    detail::Task &task;
+};
 
 } // namespace this_task
 } // namespace sched

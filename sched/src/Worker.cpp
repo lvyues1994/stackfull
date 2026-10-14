@@ -5,6 +5,7 @@
 #include <stackfull/coro/Config.h>
 #include <stackfull/coro/detail/Switch.h>
 #include <stackfull/coro/detail/ThreadState.h>
+#include <stackfull/sched/TaskContext.h>
 #include <stackfull/sched/detail/Runtime.h>
 
 #include <stackfull/coro/Fatal.h>
@@ -437,9 +438,24 @@ void Worker::reapParkedTasks() noexcept {
         if (not claimed) {
             continue;
         }
+        // Read after the claim, which synchronizes with the park that
+        // published the count. Claimed, the task cannot run or finish until
+        // it is put back, so no pin is needed for that.
+        if (task->forcedStopShields.load(std::memory_order_acquire) != 0) {
+            std::uint8_t running = raw(TaskState::Running);
+            if (not task->parkState.compare_exchange_strong(running, raw(TaskState::Parked), std::memory_order_acq_rel)) {
+                // Woken while we held it (Notified): it runs, as in onTaskParked.
+                task->parkState.store(raw(TaskState::Running), std::memory_order_relaxed);
+                core.schedule(*task);
+            }
+            continue;
+        }
 #if STACKFULL_HAS_EXCEPTIONS
         coro::detail::switchToOnTop(*dispatcher, *task, &throwForcedUnwindIntoTask);
 #else
+        if (task->context != nullptr and task->context->onDropped != nullptr) {
+            task->context->onDropped(*task->context);
+        }
         destroyTaskEntry(*task);
         core.releaseTask(*task);
 #endif
