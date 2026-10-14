@@ -41,3 +41,6 @@ stackfull_add_test(stackfull_timer_test    LABEL sched LIBS stackfull::sync SOUR
 stackfull_add_test(stackfull_io_test       LABEL io LIBS stackfull::io stackfull::sync SOURCES IoTest.cpp)
 stackfull_add_test(stackfull_net_test      LABEL io LIBS stackfull::runtime SOURCES NetTest.cpp)
 stackfull_add_test(stackfull_bridge_test   LABEL sync LIBS stackfull::runtime SOURCES BridgeTest.cpp)
+if(TARGET stackfull::exec)
+    stackfull_add_test(stackfull_exec_test LABEL exec LIBS stackfull::exec stackfull::sync lexec::runtime SOURCES ExecTest.cpp)
+endif()

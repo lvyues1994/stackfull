@@ -14,7 +14,8 @@
       "cacheVariables": {
         "CMAKE_EXPORT_COMPILE_COMMANDS": true,
         "STACKFULL_BUILD_TESTS": true,
-        "STACKFULL_BUILD_BENCH": true
+        "STACKFULL_BUILD_BENCH": true,
+        "STACKFULL_BUILD_EXEC": true
       }
     },
     {
@@ -120,7 +121,8 @@
       "displayName": "QNX aarch64le (qcc; source qnxsdp-env.sh first)",
       "toolchainFile": "${sourceDir}/cmake/toolchains/qnx.cmake",
       "cacheVariables": {
-        "STACKFULL_QNX_ARCH": "aarch64le"
+        "STACKFULL_QNX_ARCH": "aarch64le",
+        "STACKFULL_BUILD_EXEC": false
       }
     },
     {

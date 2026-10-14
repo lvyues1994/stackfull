@@ -6,6 +6,9 @@
 
 ```
 ┌───────────────────────────────────────────────────────────┐
+│ exec (C++17)    sender/receiver 桥（lexec）：wait · spawn ·   │  ✔
+│                 scheduler                                     │
+├───────────────────────────────────────────────────────────┤
 │ runtime         defaultScheduler · go · async · blockOn ·     │  ✔
 │                 blocking · resolve · connectTcp               │
 ├───────────────────────────────────────────────────────────┤
@@ -135,6 +138,7 @@ scheduler->forEachTask([](TaskInfo const &task) {   // 例如出问题时转储�
 - **计时角色不悬空**：只要还有挂起的定时器和空闲 worker，就必须有人持有计时角色；worker 带着角色空缺去跑任务前会叫醒一个空闲同伴接手，唤醒空闲 worker 时也优先绕开正在守定时器的那个。
 - **栈池共享层**：任务栈通常由 spawn 方线程分配、由运行它的 worker 释放，纯线程本地池会退化成每任务一次 mmap；池化分配器增加了一层无锁共享池（BBQ）。
 - **spawn 不碰共享缓存行**：每个 worker 在全局空闲槽位队列前缓存最多 64 个槽位，批量 32 个交换；存活任务数按 worker 分片成单写者的“已创建/已结束”计数，读取时先读全部“已结束”再读“已创建”，只会高估、不会在有任务时读成 0。全局队列空了会去偷别的 worker 缓存的槽位，`maxTasks` 仍然精确。
+- **外部线程唤醒不分配**：唤醒时判断"当前线程是不是本调度器的 worker"只查线程状态、不创建它，所以 SDK 回调线程、lexec 线程池这类外部线程唤醒任务不做任何分配（以前第一次唤醒会为该线程建一份线程状态）。
 
 ## 同步原语
 
@@ -310,6 +314,48 @@ io::BatchResult got = udp.socket->recvMany(batch, 32);   // 至少等到一个�
 - 分派在表锁下一趟收集整批事件的等待者、解锁后再唤醒；事件携带 fd 号而非指针，`Registration` 析构后的迟到事件只会查不到。等待者按值记为 `Waker`，从不指向等待方的栈。
 - `Scheduler::stop()` 的 `ForcedUnwind` 会穿过所有阻塞点，每个 park 点都有摘除守卫。任何包含 `park()` 的函数都不能是 `noexcept`。
 
+## sender/receiver（stackfull::exec）
+
+可选模块，把有栈任务接到 [lexec](https://github.com/lvyues1994/lexec)（C++17 实现的 `std::execution`）的 sender/receiver 模型上。只有头文件，以 C++17 编译，核心仍是 C++14；需要 GCC 10+ / Clang 12+，所以 QNX 7.1 用不了。
+
+```cpp
+#include <stackfull/exec/execution.hpp>
+#include <lexec/execution.hpp>
+namespace ex = lexec;
+namespace exec = stackfull::exec;
+
+exec::scheduler sf{*scheduler};
+
+// 任务里：用同步写法等任意 sender，任务 park，worker 去跑别的
+scheduler->spawn([&] {
+    auto rows = exec::wait(ex::schedule(pool) | ex::then(query));   // std::optional<std::tuple<...>>
+    int n = exec::await(ex::just(42));                              // 只要值；stopped 抛 exec::stopped_error
+});
+
+// sender 世界里：有栈任务当 sender 组合，取消照常传播
+auto [config, user] = ex::sync_wait(ex::when_all(exec::spawn(sf, readConfig), exec::spawn(sf, fetchUser))).value();
+ex::sync_wait(ex::schedule(sf) | ex::then([] { /* 在 sf 的一个任务里：可以 exec::wait、拿 Mutex */ }));
+```
+
+- `exec::wait(sndr)` 只能在任务里调用，普通线程用 `lexec::sync_wait`。返回值与 `sync_wait` 相同：值的 tuple，停止时为空，错误重新抛出（无异常构建为 `std::terminate`）；`wait_with_variant` 对应 `sync_wait_with_variant`；`exec::await` 是开启异常时的简便写法。操作状态在任务栈上，不分配；sender 在 `start()` 里同步完成就不 park；等完之后任务回到自己的调度器继续。被等待的 sender 从环境里拿到任务的停止令牌（`get_stop_token`），以及任务所在的调度器（`get_scheduler`、`get_start_scheduler`、`get_delegation_scheduler`）。
+- `exec::spawn(sf, fn[, TaskOptions])` 是一个 sender，每次 `start()` 起一个任务运行 `fn`，在任务结束处完成：返回值走 `set_value`；异常走 `set_error(exception_ptr)`，其中 `stopped_error` 走 `set_stopped`；起不了任务（容量满、栈分配失败）走 `set_error(error_code)`，调度器正在停止走 `set_stopped`。接收者的停止请求会到达任务的停止 source：任务里 `exec::wait` 的 sender 会收到，`fn` 也可以用 `exec::stop_requested()` 轮询。
+- `exec::scheduler` 把 stackfull 调度器包装成 lexec 调度器。`schedule()` 为每个操作起一个任务，后续代码就在这个任务里运行。完成调度器只对值完成报告（停止和错误可能在 `start()` 里同步发生，不在这个调度器上），前进保证为 `parallel`。
+- **结构化的 stop**：`Scheduler::stop()` 不强制展开正在 `exec::wait` 的任务（栈上的操作状态还在被别的线程使用），而是把停止请求转给被等待的 sender，等它完成后任务自己退出；一个不响应停止的 sender 会让 `stop()` 一直等下去。接收者的完成代码（`exec::spawn` 和 `schedule()` 之后的部分）同样不会被强制展开。`exec::spawn` 的任务若在 `wait` 之外被 `stop()` 结束，接收者仍恰好收到一次 `set_stopped`：开启异常时在展开途中发出，关闭异常时由调度器丢弃任务前的回调发出。核心为此提供两个钩子：`this_task::NoForcedStop`（持有期间 `stop()` 只唤醒、不展开）和 `TaskContext`（集成层挂在任务上的记录，带被丢弃时的回调）。
+- 任务里调用 `lexec::sync_wait` 会阻塞整个 worker 线程，应改用 `exec::wait`。
+
+开销（`bench/ExecBench.cpp`，x86_64 release）：
+
+| 操作 | 每次 |
+|---|---|
+| 任务里 `wait` 一个同步完成的 sender | 8–11 ns |
+| `wait(schedule(sf))`：起任务、park、唤醒 | 90–110 ns |
+| 任务里 `wait(exec::spawn(fn))` | 93–107 ns |
+| 对照：原生 `spawnJoinable` + `join`（JoinState 在堆上） | 103–116 ns |
+| 任务里 `wait(schedule(lexec 线程池))`：去了再回来 | 约 340 ns |
+| 普通线程上 `sync_wait(exec::spawn(fn))` | 约 2.0 µs（lexec 自己的 `sync_wait(schedule(pool))` 约 1.3–1.5 µs） |
+
+任务里等待 lexec 线程池上的 sender，整条路径不分配（有测试统计 `operator new`）。
+
 ## 构建
 
 ```sh
@@ -328,6 +374,8 @@ cmake --preset release && cmake --build --preset release && ctest --preset relea
 | `qnx-aarch64le` / `qnx-x86_64` | 需要先 `source qnxsdp-env.sh` |
 
 CI（`.github/workflows/ci.yml`）在 GitHub 的 Ubuntu 24.04 托管机器上对上表 7 个 Linux 预设各跑一遍配置、编译和全量测试；Android 和 QNX 不在 CI 里。
+
+`STACKFULL_BUILD_EXEC` 打开 sender/receiver 桥（见下节），预设里除 QNX 外默认打开；lexec 由 FetchContent 拉取并固定版本，`-DFETCHCONTENT_SOURCE_DIR_LEXEC=<路径>` 改用本地副本。
 
 CMake 选项：`STACKFULL_EXCEPTIONS`、`STACKFULL_SWAP_EH_GLOBALS`、`STACKFULL_TLS_BACKEND`（AUTO / THREAD_LOCAL / PTHREAD_KEY，AUTO 在 Android API < 29 选 pthread_key 以避开 emutls）、`STACKFULL_SCHED_QUEUE`（BWOS / RING）、`STACKFULL_SANITIZE`。
 

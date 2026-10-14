@@ -37,6 +37,9 @@ set_property(CACHE STACKFULL_SANITIZE PROPERTY STRINGS "" address thread undefin
 
 option(STACKFULL_BUILD_TESTS "Build unit tests" ${PROJECT_IS_TOP_LEVEL})
 option(STACKFULL_BUILD_BENCH "Build micro benchmarks" ${PROJECT_IS_TOP_LEVEL})
+option(STACKFULL_BUILD_EXEC
+    "Build stackfull::exec, the bridge to lexec's sender/receiver model. Needs C++17 \
+(GCC 10+ / Clang 12+) and fetches lexec; FETCHCONTENT_SOURCE_DIR_LEXEC points it at a local copy." OFF)
 
 # ---------------------------------------------------------------------------
 # Shared usage requirements (warnings, exception mode, sanitizers)
@@ -54,6 +57,9 @@ add_subdirectory(sched)      # L3: M:N scheduler
 add_subdirectory(sync)       # L4a: task-aware synchronization primitives
 add_subdirectory(io)         # L4b: poller-driven asynchronous IO
 add_subdirectory(runtime)    # defaultScheduler / go / async / blockOn
+if(STACKFULL_BUILD_EXEC)
+    add_subdirectory(exec)   # sender/receiver bridge (C++17, optional)
+endif()
 
 if(STACKFULL_BUILD_TESTS)
     enable_testing()

@@ -22,3 +22,8 @@ target_link_libraries(stackfull_cpu_bench PRIVATE stackfull::sched stackfull::sy
 
 add_executable(stackfull_scale_bench ScaleBench.cpp)
 target_link_libraries(stackfull_scale_bench PRIVATE stackfull::sched stackfull_warnings)
+
+if(TARGET stackfull::exec)
+    add_executable(stackfull_exec_bench ExecBench.cpp)
+    target_link_libraries(stackfull_exec_bench PRIVATE stackfull::exec lexec::runtime stackfull_warnings)
+endif()
