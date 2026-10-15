@@ -14,9 +14,8 @@ find_package(Threads REQUIRED)
 
 # stackfull_add_test(<name> LABEL <label> LIBS <targets...> SOURCES <files...>)
 #
-# Labels let a preset run a subset: the `tsan` preset only runs `queue`,
-# because ThreadSanitizer needs fiber annotations the coroutine layer does
-# not carry yet.
+# Labels group the tests by layer for `ctest -L <label>`: coro, queue,
+# sched, sync, io, exec. Every preset, tsan included, runs them all.
 function(stackfull_add_test name)
     cmake_parse_arguments(arg "" "LABEL" "LIBS;SOURCES" ${ARGN})
     add_executable(${name} ${arg_SOURCES})

@@ -342,6 +342,7 @@ ex::sync_wait(ex::schedule(sf) | ex::then([] { /* 在 sf 的一个任务里：�
 - `exec::spawn(sf, fn[, TaskOptions])` 是一个 sender，每次 `start()` 起一个任务运行 `fn`，在任务结束处完成：返回值走 `set_value`；异常走 `set_error(exception_ptr)`，其中 `stopped_error` 走 `set_stopped`；起不了任务（容量满、栈分配失败）走 `set_error(error_code)`，调度器正在停止走 `set_stopped`。接收者的停止请求会到达任务的停止 source：任务里 `exec::wait` 的 sender 会收到，`fn` 也可以用 `exec::stop_requested()` 轮询。
 - `exec::scheduler` 把 stackfull 调度器包装成 lexec 调度器。`schedule()` 为每个操作起一个任务，后续代码就在这个任务里运行。完成调度器只对值完成报告（停止和错误可能在 `start()` 里同步发生，不在这个调度器上），前进保证为 `parallel`。
 - **结构化的 stop**：`Scheduler::stop()` 不强制展开正在 `exec::wait` 的任务（栈上的操作状态还在被别的线程使用），而是把停止请求转给被等待的 sender，等它完成后任务自己退出；一个不响应停止的 sender 会让 `stop()` 一直等下去。接收者的完成代码（`exec::spawn` 和 `schedule()` 之后的部分）同样不会被强制展开。`exec::spawn` 的任务若在 `wait` 之外被 `stop()` 结束，接收者仍恰好收到一次 `set_stopped`：开启异常时在展开途中发出，关闭异常时由调度器丢弃任务前的回调发出。核心为此提供两个钩子：`this_task::NoForcedStop`（持有期间 `stop()` 只唤醒、不展开）和 `TaskContext`（集成层挂在任务上的记录，带被丢弃时的回调）。
+- `schedule()` / `continues_on(sf)` 之后的代码在任务里，可以直接调用会等待的接口（`s->read()`、`channel.recv()`、`mutex.lock()`）：等待时任务挂起，worker 去跑别的任务。但这段代码属于接收者的完成代码，`stop()` 只唤醒它一次、不展开，直接调用的读写醒来发现没有数据会接着等，`stop()` 也就一直等到数据到来。可能长时间等待的 IO 改用 `exec::wait(exec::async_read(...))`（它把停止请求转给 sender，读被撤回，`wait` 返回空）或带超时的 `readFor`；也可以用 `let_value` 把下一步接成 sender，不占任务。
 - 任务里调用 `lexec::sync_wait` 会阻塞整个 worker 线程，应改用 `exec::wait`。
 
 ### 原生 sender
@@ -357,7 +358,7 @@ auto item = ex::sync_wait(ex::when_any(
 // 接受连接、读写；continues_on(sf) 之后的代码在任务里
 auto echo = exec::async_accept(*listener)
           | ex::continues_on(sf)
-          | ex::then([](std::unique_ptr<io::TcpStream> s) { /* 任务里，可以阻塞式读写 */ });
+          | ex::then([](std::unique_ptr<io::TcpStream> s) { /* 任务里：同步写法读写，等待时任务挂起 */ });
 
 // 任务里照样能用 exec::wait 等它们
 exec::wait(exec::async_lock(mutex));     // 拿到锁后返回，记得 unlock()
