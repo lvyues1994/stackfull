@@ -402,6 +402,13 @@ void Worker::sleepIdle() noexcept {
     }
 
     gathering = true;
+    // A producer that claimed us (cleared our idle bit) before we became the timekeeper
+    // woke our Parker, not the Driver: then the Driver must not block. Against its "clear
+    // the bit, then read timekeeper", this is "write timekeeper, then read the bit", both
+    // seq_cst RMWs or loads, so one of the two sees the other.
+    if ((core.idleMask.fetch_or(0, std::memory_order_seq_cst) & (std::uint64_t{1} << index)) == 0) {
+        timeout = std::chrono::nanoseconds{0};
+    }
     if (core.driver != nullptr) {
         core.driver->wait(timeout);
     } else if (timeout < std::chrono::nanoseconds{0}) {

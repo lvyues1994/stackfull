@@ -292,6 +292,29 @@ TEST_P(IoTest, IoProgressesWhileTheOnlyWorkerIsBusyYielding) {
     EXPECT_EQ(received, "ping");
 }
 
+// A task spawned from outside while the only worker is on its way to sleep in the
+// driver must wake it, however the spawn falls against the worker becoming the
+// timekeeper: a producer may claim the worker just before.
+TEST_P(IoTest, TasksSpawnedFromOutsideWakeTheWorkerSleepingInTheDriver) {
+    scheduler.reset();
+    SchedulerOptions options;
+    options.workers = 1;
+    options.driver = poller.get();
+    scheduler = makeScheduler(options);
+    scheduler->start();
+
+    constexpr int kSpawns = 20000;
+    std::atomic<int> ran{0};
+    for (int spawn = 0; spawn < kSpawns; ++spawn) {
+        ASSERT_TRUE(scheduler->spawn([&] { ran.fetch_add(1, std::memory_order_release); }));
+        auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds{5};
+        while (ran.load(std::memory_order_acquire) == spawn) {
+            ASSERT_LT(std::chrono::steady_clock::now(), deadline) << "spawn " << spawn << " did not wake the worker";
+            std::this_thread::yield();
+        }
+    }
+}
+
 TEST_P(IoTest, TimersAndIoCoexist) {
     int ends[2] = {-1, -1};
     ASSERT_EQ(::pipe(ends), 0);
